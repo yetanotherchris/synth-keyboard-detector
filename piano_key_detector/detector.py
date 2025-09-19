@@ -496,16 +496,19 @@ class PianoKeyDetector:
         
         return min(true_right, x_end)  # Don't exceed original detection
 
-    def _find_first_white_pixel(self, gray_image: np.ndarray, start_x: int, end_x: int) -> Optional[int]:
+    def _find_first_white_pixel(self, gray_image: np.ndarray, start_x: int, end_x: int, boundary_threshold: float = None) -> Optional[int]:
         """
-        Find the first white pixel in the given range, skipping grey separators.
+        Find the first white pixel in the given range, using darkest color boundaries.
         Returns the x-coordinate of the first white pixel or None if not found.
         """
         height = gray_image.shape[0]
         
-        # Calculate adaptive threshold for what constitutes "white"
-        region_mean = np.mean(gray_image[:, start_x:min(end_x, gray_image.shape[1])])
-        white_threshold = max(150, region_mean * 0.85)  # Adaptive threshold
+        # Use provided boundary threshold, or calculate adaptive threshold as fallback
+        if boundary_threshold is None:
+            region_mean = np.mean(gray_image[:, start_x:min(end_x, gray_image.shape[1])])
+            white_threshold = max(150, region_mean * 0.85)  # Adaptive threshold
+        else:
+            white_threshold = boundary_threshold
         
         # Sample multiple rows to get a robust detection
         sample_rows = range(0, height, max(1, height // 4))
@@ -518,7 +521,7 @@ class PianoKeyDetector:
                 if y < gray_image.shape[0]:
                     pixel_value = gray_image[y, x]
                     total_samples += 1
-                    if pixel_value >= white_threshold:
+                    if pixel_value > white_threshold:  # Changed from >= to > for stricter boundary detection
                         white_pixel_count += 1
             
             # If majority of sampled pixels are white, this is our start
@@ -596,29 +599,76 @@ class PianoKeyDetector:
         
         print(f"White keys data saved to {json_path}")
 
+    def _find_darkest_boundary_color(self, gray_image: np.ndarray) -> float:
+        """
+        Find the darkest color/grey value in the image that represents boundaries between white keys.
+        This method analyzes the image to identify the darkest regions that consistently appear
+        as separators between white keys.
+        
+        Returns:
+            The darkest color value (0-255) that represents key boundaries
+        """
+        height, width = gray_image.shape
+        
+        # Calculate column-wise minimum values to find darkest areas in each column
+        column_mins = np.min(gray_image, axis=0)
+        
+        # Calculate row-wise minimums to find darkest areas in each row  
+        row_mins = np.min(gray_image, axis=1)
+        
+        # Find the global minimum (darkest pixel in entire image)
+        global_min = np.min(gray_image)
+        
+        # Look for consistent dark values that appear frequently (likely separators)
+        # Create histogram of the darkest 10% of pixels
+        dark_pixels = gray_image[gray_image <= np.percentile(gray_image, 10)]
+        
+        if len(dark_pixels) == 0:
+            # Fallback to global minimum if no dark pixels found
+            darkest_boundary = global_min
+        else:
+            # Find the most common dark value (mode of darkest pixels)
+            hist, bins = np.histogram(dark_pixels, bins=50)
+            most_common_dark_idx = np.argmax(hist)
+            darkest_boundary = bins[most_common_dark_idx]
+        
+        # Ensure we have a reasonable boundary value
+        # If the darkest value is too close to white, use a more conservative approach
+        if darkest_boundary > 200:  # Very bright "dark" areas
+            # Use a more aggressive approach - find the darkest 5% average
+            darkest_boundary = np.mean(gray_image[gray_image <= np.percentile(gray_image, 5)])
+        
+        print(f"Detected darkest boundary color: {darkest_boundary:.1f} (global min: {global_min})")
+        
+        return float(darkest_boundary)
+
     def _find_all_white_keys(self, white_keys_image: np.ndarray, params: DetectionParameters) -> list[Dict[str, object]]:
         """
-        Find all white keys using uniform spacing pattern based on actual image analysis.
-        This method uses the discovered pattern: 8px key width + 2px separator = 10px spacing.
+        Find all white keys using darkest color boundary detection.
+        This method finds the darkest color/grey values that represent boundaries between white keys,
+        and considers all non-darkest colors as valid parts of white keys.
         Returns a list of key dictionaries with position and dimensions.
         """
         height, width = white_keys_image.shape[:2]
         gray = cv2.cvtColor(white_keys_image, cv2.COLOR_BGR2GRAY)
         
-        # Based on analysis: uniform pattern is ~8px key + ~2px separator
-        # But we need to determine the actual pattern from the image
+        # Find the darkest color in the image that represents key boundaries
+        darkest_value = self._find_darkest_boundary_color(gray)
         
         # Calculate column projection to determine actual spacing
         column_projection = np.mean(gray, axis=0)
-        dark_threshold = column_projection.mean() - column_projection.std() * 0.5
         
-        # Identify regions and calculate average spacing
+        # Use darkest color as the boundary threshold - anything significantly darker than average is a separator
+        # Allow some tolerance to account for variations in separator darkness
+        boundary_threshold = darkest_value + (darkest_value * 0.2)  # 20% tolerance above darkest
+        
+        # Identify regions using the darkest color boundaries
         transitions = []
-        in_white_key = column_projection[0] > dark_threshold
+        in_white_key = column_projection[0] > boundary_threshold
         current_region_start = 0
         
         for x in range(1, len(column_projection)):
-            is_white = column_projection[x] > dark_threshold
+            is_white = column_projection[x] > boundary_threshold
             
             if is_white != in_white_key:
                 region_width = x - current_region_start
@@ -656,6 +706,7 @@ class PianoKeyDetector:
         uniform_separator_width = round(np.mean(separator_widths)) if separator_widths else 2
         uniform_spacing = uniform_key_width + uniform_separator_width
         
+        print(f"Using darkest boundary detection (value: {darkest_value:.1f}, threshold: {boundary_threshold:.1f})")
         print(f"Detected uniform pattern: {uniform_key_width}px key + {uniform_separator_width}px separator = {uniform_spacing}px spacing")
         
         # Generate keys using uniform spacing, starting from the actual detected pattern
@@ -678,22 +729,23 @@ class PianoKeyDetector:
         
         while x_position + uniform_key_width <= width:
             # Find the actual start of white pixels at this position
-            actual_key_start = self._find_first_white_pixel(gray, x_position, x_position + uniform_spacing)
+            actual_key_start = self._find_first_white_pixel(gray, x_position, x_position + uniform_spacing, boundary_threshold)
             
             if actual_key_start is None:
                 # No white pixel found, move to next position
                 x_position += uniform_spacing
                 continue
             
-            # Ensure we're still in a reasonable key area (check brightness)
+            # Ensure we're still in a reasonable key area (check brightness relative to darkest boundary)
             key_region_x_end = min(actual_key_start + uniform_key_width, width)
             key_region = gray[:, actual_key_start:key_region_x_end]
             
             if key_region.size > 0:
                 avg_brightness = np.mean(key_region)
                 
-                # Only create key if the region is reasonably bright (indicating white key)
-                if avg_brightness > column_projection.mean() * 0.8:  # At least 80% of average brightness
+                # Only create key if the region is significantly brighter than the darkest boundary
+                # This ensures we're detecting actual white key regions, not separator regions
+                if avg_brightness > boundary_threshold:  # Must be brighter than boundary threshold
                     # Calculate key properties using only the white key portion
                     cx = actual_key_start + uniform_key_width / 2.0
                     cy = height / 2.0
@@ -707,9 +759,10 @@ class PianoKeyDetector:
                     if area_ratio < params.min_white_key_area_ratio:
                         confidence *= 0.9
                     
-                    # Boost confidence for good brightness
-                    if avg_brightness > column_projection.mean():
-                        confidence = min(1.0, confidence * 1.1)
+                    # Boost confidence for good brightness relative to boundary
+                    brightness_ratio = avg_brightness / max(boundary_threshold, 1)
+                    if brightness_ratio > 1.5:  # Significantly brighter than boundary
+                        confidence = min(1.0, confidence * 1.2)
                     
                     key_info = {
                         "bbox": (actual_key_start, 0, uniform_key_width, height),
