@@ -5,7 +5,21 @@
 ## Installation
 
 ```bash
-pip install -e .
+Installation
+
+- Option A (editable/development): `pip install -e .`
+- Option B (requirements file): `pip install -r requirements.txt`
+
+Usage
+
+- After installation, import the package in Python:
+  - `from piano_key_detector import detector`
+  - See `tests/test_detector.py` for usage examples.
+
+Notes
+
+- Requires Python >= 3.8.
+- Core dependencies: opencv-python, numpy, pillow, streamlit (see `requirements.txt`).
 ```
 
 > **Note:** When running in a headless environment (such as CI), you may prefer
