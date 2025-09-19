@@ -1,2 +1,0 @@
-1. Instead of using dots for the green highlighting of the white piano key, use solid green with opacity 50%.
-2. Ensure the detection is correct. The boundary of the white key is where the colour is no longer white.

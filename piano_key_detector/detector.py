@@ -394,7 +394,8 @@ class PianoKeyDetector:
             confidence *= 0.5
         
         # Additional validation for very small keys
-        if w < 5 or area_ratio < 0.001:  # Reject tiny regions
+        min_width_pixels = max(3, int(image.shape[1] * 0.005))  # At least 0.5% of image width or 3 pixels
+        if w < min_width_pixels or area_ratio < 0.0005:  # More lenient thresholds
             return None
         
         return {
@@ -412,9 +413,11 @@ class PianoKeyDetector:
         
         true_right = x_start  # Fallback to left edge if nothing found
         
-        # Define what constitutes "white" - use a more precise threshold
-        white_threshold = 200  # Pixels above this are considered white
-        transition_threshold = 30  # Minimum difference to consider a transition
+        # Define what constitutes "white" - use adaptive threshold based on image content
+        # Calculate mean brightness in the region to set appropriate threshold
+        region_mean = np.mean(gray[:, x_start:x_end])
+        white_threshold = max(150, min(200, region_mean * 0.8))  # Adaptive but reasonable bounds
+        transition_threshold = 20  # Reduced threshold for more sensitivity
         
         # Sample multiple rows to get a robust boundary detection
         sample_rows = range(0, height, max(1, height // 8))  # More samples for better accuracy
@@ -457,17 +460,15 @@ class PianoKeyDetector:
             # Get the boundary with the most votes
             most_common_boundary = max(boundary_votes.items(), key=lambda x: x[1])
             true_right = most_common_boundary[0]
+            
+            # Ensure we don't make the key too narrow - minimum reasonable width
+            min_key_width = max(5, int((x_end - x_start) * 0.3))  # At least 30% of detected width or 5 pixels
+            if true_right - x_start < min_key_width:
+                true_right = x_start + min_key_width
         else:
-            # Fallback: use a simpler approach if no clear boundary found
-            for y in sample_rows:
-                if y >= gray.shape[0]:
-                    continue
-                for x in range(min(x_end - 1, gray.shape[1] - 1), x_start, -1):
-                    if x >= gray.shape[1]:
-                        continue
-                    if gray[y, x] >= white_threshold:  # Any white pixel
-                        true_right = max(true_right, x + 1)
-                        break
+            # Fallback: use original detection or a reasonable portion of it
+            min_key_width = max(5, int((x_end - x_start) * 0.7))  # Use 70% of original detection
+            true_right = x_start + min_key_width
         
         return min(true_right, x_end)  # Don't exceed original detection
 

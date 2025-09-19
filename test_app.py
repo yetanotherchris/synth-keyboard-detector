@@ -85,11 +85,11 @@ def _display_processing_stages(result: Dict[str, object]) -> None:
             st.write("**Stage 4: White Keys Only**")
             st.image(bgr_to_rgb(debug["stage4_crop"]), caption="Bottom 30% - white keys only", use_column_width=True)
     
-    # Stage 6: Green dots overlay
+    # Stage 6: Green solid overlay
     if "stage6_highlighted" in debug and debug["stage6_highlighted"] is not None:
         with col2:
-            st.write("**Stage 6: Green Dots Overlay**")
-            st.image(bgr_to_rgb(debug["stage6_highlighted"]), caption="First white key highlighted with green dots (50% opacity)", use_column_width=True)
+            st.write("**Stage 6: Green Solid Overlay**")
+            st.image(bgr_to_rgb(debug["stage6_highlighted"]), caption="First white key highlighted with solid green (50% opacity)", use_column_width=True)
 
 
 def _display_debug_images(result: Dict[str, object], show_edges: bool, show_binary: bool) -> None:
@@ -128,7 +128,7 @@ if uploaded_file is None:
     3. **Crop the image to the height** of these keys, the area they are inside
     4. **Further crop** the image produced in stage 3, to the bottom 30% of this image
     5. **You should have the white keys only** now
-    6. **Find the first white key** and highlight it in green, using 50% opacity green and shaded as dots
+    6. **Find the first white key** and highlight it in green, using 50% opacity solid green fill
     7. **Highlight the right side boundary** of this key using a dotted black line, 50% opacity
     8. **Display each of these stages** as images in streamlit
     """)
