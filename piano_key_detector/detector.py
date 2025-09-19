@@ -496,6 +496,37 @@ class PianoKeyDetector:
         
         return min(true_right, x_end)  # Don't exceed original detection
 
+    def _find_first_white_pixel(self, gray_image: np.ndarray, start_x: int, end_x: int) -> Optional[int]:
+        """
+        Find the first white pixel in the given range, skipping grey separators.
+        Returns the x-coordinate of the first white pixel or None if not found.
+        """
+        height = gray_image.shape[0]
+        
+        # Calculate adaptive threshold for what constitutes "white"
+        region_mean = np.mean(gray_image[:, start_x:min(end_x, gray_image.shape[1])])
+        white_threshold = max(150, region_mean * 0.85)  # Adaptive threshold
+        
+        # Sample multiple rows to get a robust detection
+        sample_rows = range(0, height, max(1, height // 4))
+        
+        for x in range(start_x, min(end_x, gray_image.shape[1])):
+            white_pixel_count = 0
+            total_samples = 0
+            
+            for y in sample_rows:
+                if y < gray_image.shape[0]:
+                    pixel_value = gray_image[y, x]
+                    total_samples += 1
+                    if pixel_value >= white_threshold:
+                        white_pixel_count += 1
+            
+            # If majority of sampled pixels are white, this is our start
+            if total_samples > 0 and white_pixel_count / total_samples >= 0.7:  # 70% white pixels
+                return x
+        
+        return None
+
     def _find_all_key_boundaries(self, edges: np.ndarray, width: int, height: int) -> list[int]:
         """
         Find all vertical boundaries that separate white keys using edge detection.
@@ -619,7 +650,8 @@ class PianoKeyDetector:
         if not white_key_widths:
             return []
         
-        # Use the most common widths or averages for uniform spacing
+        # Use the most common widths or averages for uniform sizing
+        # Key width should ONLY be the white portion, excluding grey separators
         uniform_key_width = round(np.mean(white_key_widths))
         uniform_separator_width = round(np.mean(separator_widths)) if separator_widths else 2
         uniform_spacing = uniform_key_width + uniform_separator_width
@@ -641,20 +673,29 @@ class PianoKeyDetector:
             first_white_start = 0
         
         # Generate uniform keys across the entire width
+        # Each key starts at a white pixel and has width equal to only the white portion
         x_position = first_white_start
         
         while x_position + uniform_key_width <= width:
+            # Find the actual start of white pixels at this position
+            actual_key_start = self._find_first_white_pixel(gray, x_position, x_position + uniform_spacing)
+            
+            if actual_key_start is None:
+                # No white pixel found, move to next position
+                x_position += uniform_spacing
+                continue
+            
             # Ensure we're still in a reasonable key area (check brightness)
-            key_region_x_end = min(x_position + uniform_key_width, width)
-            key_region = gray[:, x_position:key_region_x_end]
+            key_region_x_end = min(actual_key_start + uniform_key_width, width)
+            key_region = gray[:, actual_key_start:key_region_x_end]
             
             if key_region.size > 0:
                 avg_brightness = np.mean(key_region)
                 
                 # Only create key if the region is reasonably bright (indicating white key)
                 if avg_brightness > column_projection.mean() * 0.8:  # At least 80% of average brightness
-                    # Calculate key properties
-                    cx = x_position + uniform_key_width / 2.0
+                    # Calculate key properties using only the white key portion
+                    cx = actual_key_start + uniform_key_width / 2.0
                     cy = height / 2.0
                     aspect = height / float(max(uniform_key_width, 1))
                     area_ratio = (uniform_key_width * height) / float(width * height)
@@ -671,7 +712,7 @@ class PianoKeyDetector:
                         confidence = min(1.0, confidence * 1.1)
                     
                     key_info = {
-                        "bbox": (x_position, 0, uniform_key_width, height),
+                        "bbox": (actual_key_start, 0, uniform_key_width, height),
                         "center": (cx, cy),
                         "confidence": confidence,
                         "aspect_ratio": aspect,
