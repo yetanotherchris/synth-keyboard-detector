@@ -1,19 +1,16 @@
-"""Key detection implementation."""
+"""Simplified key detection implementation - detects only the first white key."""
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, Optional, Tuple
 
 import cv2
 import numpy as np
 
-from . import keyboard_models
 from .utils import (
-    bbox_union,
-    clamp,
     ensure_odd,
     load_image,
-    normalize_point,
+    save_debug_image,
 )
 
 
@@ -26,26 +23,18 @@ class DetectionParameters:
     canny_high: int = 180
     adaptive_threshold_block_size: int = 35
     adaptive_threshold_c: int = 5
-    projection_smooth_size: int = 9
-    projection_peak_ratio: float = 0.45
+    projection_peak_ratio: float = 0.55
     min_white_key_width_ratio: float = 0.01
     max_white_key_width_ratio: float = 0.2
     min_white_key_aspect: float = 2.0
     min_white_key_area_ratio: float = 0.003
-    white_key_width_lower_factor: float = 0.45
-    white_key_width_upper_factor: float = 1.7
-    white_vertical_margin_ratio: float = 0.02
-    black_key_height_ratio: float = 0.55
-    black_key_relative_width: float = 0.65
-    black_key_darkness_threshold: float = 0.35
-    black_key_vertical_offset: float = 0.0
 
     def to_dict(self) -> Dict[str, float]:
         return self.__dict__.copy()
 
 
 class PianoKeyDetector:
-    """Detect piano keys from top-down keyboard images."""
+    """Detect the first (leftmost) white key from top-down keyboard images."""
 
     def __init__(self, **kwargs):
         self.params = DetectionParameters(**kwargs)
@@ -59,11 +48,10 @@ class PianoKeyDetector:
     def detect_keys(
         self,
         image,
-        force_keyboard_type: Optional[str] = None,
         debug: bool = True,
         **overrides,
     ) -> Dict[str, object]:
-        """Detect keys within ``image`` and return metadata."""
+        """Detect the first white key in the image and return metadata."""
 
         params = self._merge_params(overrides)
         image_bgr = load_image(image)
@@ -71,7 +59,20 @@ class PianoKeyDetector:
             raise ValueError("Could not load image")
 
         height, width = image_bgr.shape[:2]
-        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+        
+        # Stage 1: Crop to bottom 30% of the image to remove background
+        stage1_crop_y = int(height * 0.7)  # Start from 70% down (keep bottom 30%)
+        stage1_crop = image_bgr[stage1_crop_y:, :]
+        stage1_height, stage1_width = stage1_crop.shape[:2]
+        
+        # Stage 2: Detect white key height and crop to just the keyboard
+        keyboard_crop, keyboard_crop_y_offset = self._crop_to_keyboard_area(
+            stage1_crop, params
+        )
+        keyboard_height, keyboard_width = keyboard_crop.shape[:2]
+        
+        # Process the final cropped keyboard image
+        gray = cv2.cvtColor(keyboard_crop, cv2.COLOR_BGR2GRAY)
         blur_kernel = ensure_odd(int(params.blur_kernel_size))
         blurred = cv2.GaussianBlur(gray, (blur_kernel, blur_kernel), 0)
 
@@ -92,106 +93,296 @@ class PianoKeyDetector:
 
         white_mask = binary
 
-        white_boxes = self._locate_white_keys(white_mask, width, height, params)
-
-        if white_boxes:
-            white_boxes = sorted(white_boxes, key=lambda b: b[0])
-
-        model = self._resolve_keyboard_model(force_keyboard_type, len(white_boxes))
-
-        white_infos = self._build_white_key_info(white_boxes, params)
-        bounding_box = bbox_union([info["bbox"] for info in white_infos])
-
-        black_infos: List[Dict[str, object]] = []
-        if white_infos:
-            pattern = self._black_pattern_for_model(model, len(white_infos))
-            black_infos = self._detect_black_keys(
-                gray,
-                white_infos,
-                bounding_box,
-                pattern,
-                params,
-            )
-
-        confidence = self._compute_confidence(model, white_infos, black_infos)
+        # Find the first (leftmost) white key using the keyboard crop
+        first_white_key = self._find_first_white_key(
+            white_mask, 
+            keyboard_crop, 
+            keyboard_width, 
+            keyboard_height, 
+            params,
+            y_offset=0  # Keep coordinates relative to keyboard crop
+        )
 
         result: Dict[str, object] = {
-            "keyboard_type": model.name if model else "unknown",
-            "total_keys": model.total_keys if model else len(white_infos) + len(black_infos),
-            "white_keys": white_infos,
-            "black_keys": black_infos,
-            "confidence": confidence,
-            "bounding_box": bounding_box,
+            "first_white_key": first_white_key,
+            "found": first_white_key is not None,
             "parameters": params.to_dict(),
         }
 
         if debug:
+            # Save cropped image for debugging
+            save_debug_image(stage1_crop, "30_percent_crop")
+            save_debug_image(keyboard_crop, "keyboard_crop")
+            
             result["debug"] = {
                 "original": image_bgr,
+                "stage1_crop": stage1_crop,
+                "keyboard_crop": keyboard_crop,
                 "gray": gray,
                 "blurred": blurred,
                 "edges": edges,
                 "binary": white_mask,
-                "column_projection": self._column_projection(white_mask),
             }
 
         return result
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+    def _crop_to_keyboard_area(
+        self, 
+        stage1_crop: np.ndarray, 
+        params: DetectionParameters
+    ) -> Tuple[np.ndarray, int]:
+        """
+        Detect white key height and crop to just the keyboard area.
+        Returns the cropped keyboard image and the y-offset from stage1_crop.
+        """
+        height, width = stage1_crop.shape[:2]
+        gray = cv2.cvtColor(stage1_crop, cv2.COLOR_BGR2GRAY)
+        
+        # Apply basic preprocessing to highlight white keys
+        blur_kernel = ensure_odd(int(params.blur_kernel_size))
+        blurred = cv2.GaussianBlur(gray, (blur_kernel, blur_kernel), 0)
+        
+        # Threshold to find white regions (white keys)
+        _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        # Find horizontal projection to detect keyboard boundaries
+        row_projection = binary.sum(axis=1).astype(np.float32)
+        
+        if row_projection.max() <= 0:
+            # Fallback: return the original stage1_crop
+            return stage1_crop, 0
+        
+        # Find the top and bottom of the keyboard by detecting white key regions
+        threshold = row_projection.max() * 0.3  # Lower threshold for white key detection
+        
+        # Find top boundary (first significant white region from top)
+        keyboard_top = 0
+        for i, value in enumerate(row_projection):
+            if value >= threshold:
+                keyboard_top = i
+                break
+        
+        # Find bottom boundary (last significant white region from bottom)
+        keyboard_bottom = height - 1
+        for i in range(height - 1, -1, -1):
+            if row_projection[i] >= threshold:
+                keyboard_bottom = i
+                break
+        
+        # Ensure we have a reasonable keyboard height
+        keyboard_height = keyboard_bottom - keyboard_top + 1
+        min_keyboard_height = int(height * 0.1)  # At least 10% of stage1 height
+        
+        if keyboard_height < min_keyboard_height:
+            # Fallback: return the original stage1_crop
+            return stage1_crop, 0
+        
+        # Add small padding to include key edges
+        padding = int(keyboard_height * 0.05)  # 5% padding
+        keyboard_top = max(0, keyboard_top - padding)
+        keyboard_bottom = min(height - 1, keyboard_bottom + padding)
+        
+        # Crop to the detected keyboard area
+        keyboard_crop = stage1_crop[keyboard_top:keyboard_bottom + 1, :]
+        
+        return keyboard_crop, keyboard_top
+
+    def detect_all_white_key_boundaries(
+        self,
+        image,
+        debug: bool = True,
+        **overrides,
+    ) -> Dict[str, object]:
+        """Detect all white key boundaries in the image and return metadata."""
+
+        params = self._merge_params(overrides)
+        image_bgr = load_image(image)
+        if image_bgr is None:
+            raise ValueError("Could not load image")
+
+        height, width = image_bgr.shape[:2]
+        
+        # Stage 1: Crop to bottom 30% of the image to remove background
+        stage1_crop_y = int(height * 0.7)  # Start from 70% down (keep bottom 30%)
+        stage1_crop = image_bgr[stage1_crop_y:, :]
+        stage1_height, stage1_width = stage1_crop.shape[:2]
+        
+        # Stage 2: Detect white key height and crop to just the keyboard
+        keyboard_crop, keyboard_crop_y_offset = self._crop_to_keyboard_area(
+            stage1_crop, params
+        )
+        keyboard_height, keyboard_width = keyboard_crop.shape[:2]
+        
+        # Process the final cropped keyboard image
+        gray = cv2.cvtColor(keyboard_crop, cv2.COLOR_BGR2GRAY)
+        blur_kernel = ensure_odd(int(params.blur_kernel_size))
+        blurred = cv2.GaussianBlur(gray, (blur_kernel, blur_kernel), 0)
+
+        edges = cv2.Canny(blurred, int(params.canny_low), int(params.canny_high))
+
+        _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        if params.adaptive_threshold_block_size > 0:
+            block_size = ensure_odd(int(params.adaptive_threshold_block_size))
+            adaptive = cv2.adaptiveThreshold(
+                blurred,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY,
+                block_size,
+                int(params.adaptive_threshold_c),
+            )
+            binary = cv2.bitwise_and(binary, adaptive)
+
+        white_mask = binary
+
+        # Find all white key boundaries
+        all_white_keys = self._find_all_white_key_boundaries(
+            white_mask, 
+            keyboard_crop, 
+            keyboard_width, 
+            keyboard_height, 
+            params
+        )
+
+        result: Dict[str, object] = {
+            "all_white_keys": all_white_keys,
+            "num_keys_found": len(all_white_keys),
+            "parameters": params.to_dict(),
+        }
+
+        if debug:
+            # Save cropped image for debugging
+            save_debug_image(stage1_crop, "30_percent_crop_all_keys")
+            
+            # Create visualization with all key boundaries
+            visualization = self._create_key_boundaries_visualization(
+                stage1_crop, all_white_keys, stage1_crop_y, keyboard_crop_y_offset
+            )
+            save_debug_image(visualization, "all_white_key_boundaries")
+            
+            result["debug"] = {
+                "original": image_bgr,
+                "stage1_crop": stage1_crop,
+                "keyboard_crop": keyboard_crop,
+                "gray": gray,
+                "blurred": blurred,
+                "edges": edges,
+                "binary": white_mask,
+                "visualization": visualization,
+            }
+
+        return result
+
+    def keyboard_crop_with_key_detection(
+        self,
+        image,
+        debug: bool = True,
+        **overrides,
+    ) -> Dict[str, object]:
+        """
+        3-stage cropping and detection:
+        1. Crop to bottom 30% of image
+        2. Detect keyboard area and crop further  
+        3. Create additional crop for better white key detection
+        4. Use stage 3 to detect key width, then apply to stage 2 image
+        """
+        
+        params = self._merge_params(overrides)
+        image_bgr = load_image(image)
+        if image_bgr is None:
+            raise ValueError("Could not load image")
+
+        height, width = image_bgr.shape[:2]
+        
+        # Stage 1: Crop to bottom 30% of the image to remove background
+        stage1_crop_y = int(height * 0.7)  # Start from 70% down (keep bottom 30%)
+        stage1_crop = image_bgr[stage1_crop_y:, :]
+        stage1_height, stage1_width = stage1_crop.shape[:2]
+        
+        # Stage 2: Detect white key height and crop to just the keyboard
+        stage2_crop, stage2_crop_y_offset = self._crop_to_keyboard_area(
+            stage1_crop, params
+        )
+        stage2_height, stage2_width = stage2_crop.shape[:2]
+        
+        # Stage 3: Create additional crop for better white key detection
+        # Take middle portion of stage2 to focus on white key area
+        stage3_crop, stage3_crop_y_offset = self._create_stage3_crop(stage2_crop)
+        stage3_height, stage3_width = stage3_crop.shape[:2]
+        
+        # Detect white keys on stage 3 to determine key width
+        stage3_white_keys = self._detect_white_keys_stage3(stage3_crop, params)
+        
+        # Extract key width information from stage 3 detection
+        detected_key_width = self._extract_key_width_from_stage3(stage3_white_keys, stage3_width)
+        
+        # Use detected key width to find all white keys on stage 2 image
+        stage2_white_keys = self._apply_detection_to_stage2(
+            stage2_crop, detected_key_width, params
+        )
+        
+        result: Dict[str, object] = {
+            "stage3_white_keys": stage3_white_keys,
+            "stage2_white_keys": stage2_white_keys, 
+            "detected_key_width": detected_key_width,
+            "num_stage3_keys": len(stage3_white_keys),
+            "num_stage2_keys": len(stage2_white_keys),
+            "parameters": params.to_dict(),
+        }
+
+        if debug:
+            # Save all crops for debugging
+            save_debug_image(stage1_crop, "stage1_30_percent_crop")
+            save_debug_image(stage2_crop, "stage2_keyboard_crop") 
+            save_debug_image(stage3_crop, "stage3_detection_crop")
+            
+            # Create visualization showing boundaries on 30% crop only
+            visualization = self._create_stage1_visualization(
+                stage1_crop, stage3_white_keys, stage2_crop_y_offset, stage3_crop_y_offset
+            )
+            save_debug_image(visualization, "stage1_with_boundaries")
+            
+            result["debug"] = {
+                "original": image_bgr,
+                "stage1_crop": stage1_crop,
+                "stage2_crop": stage2_crop,
+                "stage3_crop": stage3_crop,
+                "visualization": visualization,
+            }
+
+        return result
+
     def _merge_params(self, overrides: Dict[str, object]) -> DetectionParameters:
         params_dict = self.params.to_dict()
         params_dict.update(overrides)
         return DetectionParameters(**params_dict)
 
-    def _column_projection(self, white_mask: np.ndarray) -> np.ndarray:
-        projection = white_mask.sum(axis=0).astype(np.float32)
-        return projection
-
-    def _locate_white_keys(
+    def _find_first_white_key(
         self,
         white_mask: np.ndarray,
+        cropped_image: np.ndarray,
         width: int,
         height: int,
         params: DetectionParameters,
-    ) -> List[tuple]:
-        contour_boxes = self._locate_white_keys_contours(white_mask, width, height, params)
-        projection_boxes = self._locate_white_keys_projection(white_mask, width, height, params)
-
-        if contour_boxes and projection_boxes:
-            if len(contour_boxes) >= len(projection_boxes):
-                return contour_boxes
-            return projection_boxes
-        if contour_boxes:
-            return contour_boxes
-        return projection_boxes
-
-    def _locate_white_keys_projection(
-        self,
-        white_mask: np.ndarray,
-        width: int,
-        height: int,
-        params: DetectionParameters,
-    ) -> List[tuple]:
+        y_offset: int = 0,
+    ) -> Optional[Dict[str, object]]:
+        """Find the leftmost white key using column projection in the cropped region."""
+        
+        # Get column projection to find white regions
         column_projection = white_mask.sum(axis=0).astype(np.float32)
-        kernel = int(max(3, params.projection_smooth_size))
-        if kernel % 2 == 0:
-            kernel += 1
-        smooth_kernel = np.ones(kernel, dtype=np.float32) / float(kernel)
-        smooth_projection = np.convolve(column_projection, smooth_kernel, mode="same")
-        max_val = smooth_projection.max() if smooth_projection.size else 0.0
-        if max_val <= 0:
-            return []
-        threshold = max_val * float(params.projection_peak_ratio)
-
-        min_width = max(int(params.min_white_key_width_ratio * width), 2)
-        max_width = max(int(params.max_white_key_width_ratio * width), min_width)
-
-        regions: List[tuple] = []
+        if column_projection.max() <= 0:
+            return None
+        
+        # Find threshold for detecting white key regions
+        threshold = column_projection.max() * params.projection_peak_ratio
+        min_width = max(int(params.min_white_key_width_ratio * width), 3)
+        max_width = int(params.max_white_key_width_ratio * width)
+        
+        # Find the first significant white region from left to right
         in_region = False
         start = 0
-        for idx, value in enumerate(smooth_projection):
+        
+        for idx, value in enumerate(column_projection):
             if value >= threshold:
                 if not in_region:
                     in_region = True
@@ -199,297 +390,404 @@ class PianoKeyDetector:
             else:
                 if in_region:
                     end = idx
-                    width_region = end - start
-                    if width_region >= min_width:
-                        regions.append((start, end))
+                    region_width = end - start
+                    if min_width <= region_width <= max_width:
+                        # Found the first valid white key region
+                        return self._extract_key_from_region(
+                            cropped_image, start, end, height, params, y_offset
+                        )
                     in_region = False
+        
+        # Handle case where region extends to the end
         if in_region:
-            end = len(smooth_projection) - 1
-            if end - start >= min_width:
-                regions.append((start, end))
+            end = len(column_projection) - 1
+            region_width = end - start
+            if min_width <= region_width <= max_width:
+                return self._extract_key_from_region(
+                    cropped_image, start, end, height, params, y_offset
+                )
+        
+        return None
 
-        boxes: List[tuple] = []
-        if not regions:
-            return boxes
-
-        refined_regions: List[tuple] = []
-        for start, end in regions:
-            width_region = end - start
-            if width_region < min_width:
-                continue
-            if width_region > max_width:
-                # Split wide regions to avoid merged keys
-                pieces = int(round(width_region / float(max_width)))
-                if pieces < 1:
-                    pieces = 1
-                step = width_region / pieces
-                for i in range(pieces):
-                    seg_start = int(start + i * step)
-                    seg_end = int(min(end, start + (i + 1) * step))
-                    if seg_end - seg_start >= min_width:
-                        refined_regions.append((seg_start, seg_end))
-            else:
-                refined_regions.append((start, end))
-
-        if not refined_regions:
-            return boxes
-
-        # Derive vertical bounds using row projection
-        row_projection = white_mask.sum(axis=1).astype(np.float32)
-        row_max = row_projection.max() if row_projection.size else 0
-        if row_max > 0:
-            row_threshold = row_max * 0.05
-            rows = np.where(row_projection >= row_threshold)[0]
-            if rows.size:
-                row_top = int(rows.min())
-                row_bottom = int(rows.max())
-            else:
-                row_top = 0
-                row_bottom = height - 1
+    def _extract_key_from_region(
+        self,
+        cropped_image: np.ndarray,
+        x_start: int,
+        x_end: int,
+        height: int,
+        params: DetectionParameters,
+        y_offset: int = 0,
+    ) -> Dict[str, object]:
+        """Extract key information from a detected white region in the cropped image."""
+        
+        # Convert to grayscale for analysis
+        if len(cropped_image.shape) == 3:
+            gray = cv2.cvtColor(cropped_image, cv2.COLOR_BGR2GRAY)
         else:
-            row_top = 0
-            row_bottom = height - 1
+            gray = cropped_image
+        
+        # Since we're working with the bottom 30% crop, use the full height
+        y_start = 0
+        y_end = height - 1
+        
+        # Find the true right boundary of the white key in the cropped region
+        true_right_x = self._find_true_right_boundary_cropped(gray, x_start, x_end, y_start, y_end)
+        
+        # Calculate bounding box in keyboard crop coordinates
+        x = x_start
+        y = y_start  # Keep relative to keyboard crop
+        w = true_right_x - x_start
+        h = y_end - y_start + 1
+        
+        # Calculate center in keyboard crop coordinates
+        cx = x + w / 2.0
+        cy = y + h / 2.0
+        
+        # Basic validation
+        aspect = h / float(max(w, 1))
+        # Use original image dimensions for area calculation
+        area_ratio = (w * h) / float(cropped_image.shape[1] * cropped_image.shape[0])
+        
+        confidence = 1.0
+        if aspect < params.min_white_key_aspect:
+            confidence *= 0.5
+        if area_ratio < params.min_white_key_area_ratio:
+            confidence *= 0.5
+        
+        return {
+            "bbox": (x, y, w, h),
+            "center": (cx, cy),
+            "confidence": confidence,
+            "aspect_ratio": aspect,
+            "area_ratio": area_ratio,
+        }
 
-        margin = int(params.white_vertical_margin_ratio * height)
-        row_top = max(0, row_top - margin)
-        row_bottom = min(height - 1, row_bottom + margin)
-        key_height = max(1, row_bottom - row_top + 1)
-
-        for start, end in refined_regions:
-            x0 = max(0, int(start))
-            x1 = min(width - 1, int(end))
-            if x1 <= x0:
+    def _find_true_right_boundary_cropped(
+        self,
+        gray: np.ndarray,
+        x_start: int,
+        x_end: int,
+        y_start: int,
+        y_end: int,
+    ) -> int:
+        """
+        Find the true right boundary of the white key in the cropped region.
+        Since we're working with the bottom 30% crop where black keys don't interfere,
+        we can use simpler boundary detection.
+        """
+        true_right = x_start  # Fallback to left edge if nothing found
+        max_gradient = 0
+        
+        # Sample several rows in the cropped region
+        sample_rows = range(y_start, min(y_end + 1, gray.shape[0]), max(1, (y_end - y_start) // 5))
+        
+        for y in sample_rows:
+            if y >= gray.shape[0]:
                 continue
-            roi = white_mask[row_top:row_top + key_height, x0:x1]
-            ys, xs = np.where(roi > 0)
-            if ys.size:
-                top = int(row_top + ys.min())
-                bottom = int(row_top + ys.max())
-            else:
-                top = row_top
-                bottom = row_top + key_height - 1
-            y = max(0, top - margin)
-            h = min(height - y, (bottom + margin) - y + 1)
-            w = x1 - x0
-            if w <= 0 or h <= 0:
-                continue
-            aspect = h / float(w)
-            if aspect < params.min_white_key_aspect:
-                continue
-            area_ratio = (w * h) / float(width * height)
-            if area_ratio < params.min_white_key_area_ratio:
-                continue
-            boxes.append((x0, y, w, h))
+                
+            # Scan from right to left within the detected region
+            for x in range(min(x_end - 1, gray.shape[1] - 1), x_start, -1):
+                if x >= gray.shape[1]:
+                    continue
+                    
+                pixel_val = gray[y, x]
+                
+                # Look for white/light pixels (key surface)
+                if pixel_val > 180:  # White key surface
+                    # Check if the next pixel to the right is significantly darker (boundary)
+                    if x + 1 < gray.shape[1]:
+                        next_pixel = int(gray[y, x + 1])
+                        gradient = int(pixel_val) - next_pixel
+                        
+                        # If there's a significant drop in brightness (white key edge)
+                        if gradient > 20 and gradient > max_gradient:
+                            max_gradient = gradient
+                            true_right = max(true_right, x + 1)
+                            break
+                    else:
+                        # At image edge
+                        true_right = max(true_right, x + 1)
+                        break
+                
+                # Look for light grey pixels (key surface with slight shading)
+                elif pixel_val > 140:  # Light grey key surface
+                    if x + 1 < gray.shape[1]:
+                        next_pixel = int(gray[y, x + 1])
+                        gradient = int(pixel_val) - next_pixel
+                        
+                        if gradient > 12 and gradient > max_gradient:
+                            max_gradient = gradient
+                            true_right = max(true_right, x + 1)
+                            break
+                    else:
+                        true_right = max(true_right, x + 1)
+                        break
+        
+        # Ensure we found a reasonable boundary
+        if true_right <= x_start:
+            # Fallback: look for the rightmost bright pixel
+            for y in sample_rows:
+                if y >= gray.shape[0]:
+                    continue
+                for x in range(min(x_end - 1, gray.shape[1] - 1), x_start, -1):
+                    if x >= gray.shape[1]:
+                        continue
+                    if gray[y, x] > 160:  # Any reasonably bright pixel
+                        true_right = max(true_right, x + 1)
+                        break
+        
+        return min(true_right, x_end)  # Don't exceed original detection
 
-        if not boxes:
-            return boxes
-
-        return self._filter_white_key_width_outliers(boxes, params)
-
-    def _locate_white_keys_contours(
+    def _find_all_white_key_boundaries(
         self,
         white_mask: np.ndarray,
+        cropped_image: np.ndarray,
         width: int,
         height: int,
         params: DetectionParameters,
-    ) -> List[tuple]:
-        min_width = max(int(params.min_white_key_width_ratio * width), 2)
-        vertical_kernel_height = max(int(height * 0.25), 5)
-        vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, vertical_kernel_height))
-        processed = cv2.morphologyEx(white_mask, cv2.MORPH_CLOSE, vertical_kernel, iterations=1)
-        contours, _ = cv2.findContours(processed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        boxes: List[tuple] = []
-        margin = int(params.white_vertical_margin_ratio * height)
-        for contour in contours:
-            x, y, w, h = cv2.boundingRect(contour)
-            if w < min_width:
-                continue
-            if h < height * 0.3:
-                continue
-            aspect = h / float(max(w, 1))
-            if aspect < params.min_white_key_aspect:
-                continue
-            area_ratio = (w * h) / float(width * height)
-            if area_ratio < params.min_white_key_area_ratio:
-                continue
-            y = max(0, y - margin)
-            h = min(height - y, h + 2 * margin)
-            boxes.append((x, y, w, h))
-
-        if not boxes:
+    ) -> list:
+        """Find all white key boundaries using column projection in the cropped region."""
+        
+        # Get column projection to find white regions
+        column_projection = white_mask.sum(axis=0).astype(np.float32)
+        if column_projection.max() <= 0:
             return []
-
-        boxes = sorted(boxes, key=lambda b: b[0])
-        return self._filter_white_key_width_outliers(boxes, params)
-
-    def _filter_white_key_width_outliers(
-        self,
-        boxes: Sequence[tuple],
-        params: DetectionParameters,
-    ) -> List[tuple]:
-        if not boxes:
-            return []
-        widths = np.array([box[2] for box in boxes], dtype=np.float32)
-        if widths.size == 0:
-            return list(boxes)
-        median_width = float(np.median(widths))
-        lower = median_width * params.white_key_width_lower_factor
-        upper = median_width * params.white_key_width_upper_factor
-        filtered = [box for box in boxes if lower <= box[2] <= upper]
-        if filtered:
-            return filtered
-        return list(boxes)
-
-    def _resolve_keyboard_model(
-        self,
-        force_keyboard_type: Optional[str],
-        detected_white_keys: int,
-    ) -> Optional[keyboard_models.KeyboardModel]:
-        if force_keyboard_type:
-            key = str(force_keyboard_type).lower().replace("_key", "")
-            if key in {"auto", "automatic", "none", ""}:
-                forced = None
+        
+        # Find threshold for detecting white key regions
+        threshold = column_projection.max() * params.projection_peak_ratio
+        min_width = max(int(params.min_white_key_width_ratio * width), 3)
+        max_width = int(params.max_white_key_width_ratio * width)
+        
+        all_keys = []
+        in_region = False
+        start = 0
+        
+        for idx, value in enumerate(column_projection):
+            if value >= threshold:
+                if not in_region:
+                    in_region = True
+                    start = idx
             else:
-                forced = keyboard_models.get_model(key) or keyboard_models.get_model(f"{key}_key")
-            if forced:
-                return forced
-        if detected_white_keys <= 0:
+                if in_region:
+                    end = idx
+                    region_width = end - start
+                    if min_width <= region_width <= max_width:
+                        # Found a valid white key region
+                        key_info = self._extract_key_from_region(
+                            cropped_image, start, end, height, params, y_offset=0
+                        )
+                        if key_info:
+                            all_keys.append(key_info)
+                    in_region = False
+        
+        # Handle case where region extends to the end
+        if in_region:
+            end = len(column_projection) - 1
+            region_width = end - start
+            if min_width <= region_width <= max_width:
+                key_info = self._extract_key_from_region(
+                    cropped_image, start, end, height, params, y_offset=0
+                )
+                if key_info:
+                    all_keys.append(key_info)
+        
+        return all_keys
+
+    def _create_key_boundaries_visualization(
+        self,
+        stage1_crop: np.ndarray,
+        all_white_keys: list,
+        stage1_crop_y: int,
+        keyboard_crop_y_offset: int,
+    ) -> np.ndarray:
+        """Create a visualization showing detected white key boundaries on the original crop."""
+        
+        # Create a copy of the stage1_crop for visualization
+        vis_image = stage1_crop.copy()
+        
+        # Draw rectangles for each detected white key
+        for i, key in enumerate(all_white_keys):
+            bbox = key['bbox']
+            x, y, w, h = bbox
+            
+            # Adjust coordinates to stage1_crop space
+            # The bbox is relative to keyboard_crop, so we need to add the keyboard_crop_y_offset
+            adjusted_y = y + keyboard_crop_y_offset
+            
+            # Draw rectangle (green color)
+            cv2.rectangle(vis_image, (x, adjusted_y), (x + w, adjusted_y + h), (0, 255, 0), 2)
+            
+            # Add key number label
+            label = f"Key {i+1}"
+            label_pos = (x + 5, adjusted_y + 20)
+            cv2.putText(vis_image, label, label_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        
+        return vis_image
+
+    def _create_stage3_crop(self, stage2_crop: np.ndarray) -> Tuple[np.ndarray, int]:
+        """
+        Create stage 3 crop for better white key detection.
+        Takes the middle portion of stage2 to focus on white key area.
+        """
+        height, width = stage2_crop.shape[:2]
+        
+        # Take middle 60% of the height to focus on white keys
+        crop_start_ratio = 0.2  # Start at 20% from top
+        crop_end_ratio = 0.8    # End at 80% from top
+        
+        start_y = int(height * crop_start_ratio)
+        end_y = int(height * crop_end_ratio)
+        
+        # Ensure we have at least some height
+        if end_y - start_y < 20:
+            start_y = 0
+            end_y = height
+        
+        stage3_crop = stage2_crop[start_y:end_y, :]
+        
+        return stage3_crop, start_y
+
+    def _detect_white_keys_stage3(self, stage3_crop: np.ndarray, params: DetectionParameters) -> list:
+        """
+        Detect white keys on stage 3 crop using enhanced processing.
+        """
+        height, width = stage3_crop.shape[:2]
+        
+        # Process the stage3 crop
+        gray = cv2.cvtColor(stage3_crop, cv2.COLOR_BGR2GRAY)
+        blur_kernel = ensure_odd(int(params.blur_kernel_size))
+        blurred = cv2.GaussianBlur(gray, (blur_kernel, blur_kernel), 0)
+
+        # Use binary threshold to find white regions
+        _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        # Apply adaptive threshold for better edge detection
+        if params.adaptive_threshold_block_size > 0:
+            block_size = ensure_odd(int(params.adaptive_threshold_block_size))
+            adaptive = cv2.adaptiveThreshold(
+                blurred,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY,
+                block_size,
+                int(params.adaptive_threshold_c),
+            )
+            binary = cv2.bitwise_and(binary, adaptive)
+
+        # Find white key boundaries using column projection
+        return self._find_all_white_key_boundaries(
+            binary, stage3_crop, width, height, params
+        )
+
+    def _extract_key_width_from_stage3(self, stage3_white_keys: list, stage3_width: int) -> Optional[int]:
+        """
+        Extract typical white key width from stage 3 detection results.
+        """
+        if not stage3_white_keys:
             return None
-        return keyboard_models.find_closest_model(detected_white_keys)
+        
+        # Calculate widths of detected keys
+        widths = []
+        for key in stage3_white_keys:
+            bbox = key['bbox']
+            w = bbox[2]  # width is the 3rd element
+            widths.append(w)
+        
+        if not widths:
+            return None
+        
+        # Use median width as the typical key width
+        widths.sort()
+        median_width = widths[len(widths) // 2]
+        
+        return median_width
 
-    def _build_white_key_info(
-        self,
-        white_boxes: Sequence[tuple],
-        params: DetectionParameters,
-    ) -> List[Dict[str, object]]:
-        if not white_boxes:
-            return []
-        white_boxes = sorted(white_boxes, key=lambda b: b[0])
-        widths = np.array([box[2] for box in white_boxes], dtype=np.float32)
-        median_width = float(np.median(widths)) if widths.size else 0.0
-        boxes = []
-        for index, box in enumerate(white_boxes):
-            x, y, w, h = map(int, box)
-            cx = x + w / 2.0
-            cy = y + h / 2.0
-            boxes.append(
-                {
-                    "index": index,
-                    "bbox": (x, y, w, h),
-                    "center": (cx, cy),
-                    "normalized_center": (0.0, 0.0),  # Placeholder, filled later
-                    "confidence": 1.0 if median_width == 0 else clamp(1.0 - abs(w - median_width) / median_width, 0.0, 1.0),
-                }
+    def _apply_detection_to_stage2(
+        self, 
+        stage2_crop: np.ndarray, 
+        detected_key_width: Optional[int], 
+        params: DetectionParameters
+    ) -> list:
+        """
+        Apply detection to stage 2 image using the key width detected from stage 3.
+        """
+        if detected_key_width is None:
+            # Fallback to regular detection
+            height, width = stage2_crop.shape[:2]
+            gray = cv2.cvtColor(stage2_crop, cv2.COLOR_BGR2GRAY)
+            blur_kernel = ensure_odd(int(params.blur_kernel_size))
+            blurred = cv2.GaussianBlur(gray, (blur_kernel, blur_kernel), 0)
+            _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            
+            return self._find_all_white_key_boundaries(
+                binary, stage2_crop, width, height, params
             )
-        bounding_box = bbox_union([b["bbox"] for b in boxes])
-        for entry in boxes:
-            cx, cy = entry["center"]
-            entry["normalized_center"] = normalize_point(cx, cy, bounding_box)
-        return boxes
-
-    def _black_pattern_for_model(
-        self,
-        model: Optional[keyboard_models.KeyboardModel],
-        detected_white_keys: int,
-    ) -> List[bool]:
-        if model:
-            pattern = model.black_key_pattern
-        else:
-            pattern = keyboard_models.generate_black_key_pattern(detected_white_keys)
-        if detected_white_keys <= 1:
-            return []
-        if len(pattern) >= detected_white_keys - 1:
-            return pattern[: detected_white_keys - 1]
-        # Pad if pattern shorter
-        extras = keyboard_models.generate_black_key_pattern(detected_white_keys)
-        return extras[: detected_white_keys - 1]
-
-    def _detect_black_keys(
-        self,
-        gray: np.ndarray,
-        white_infos: Sequence[Dict[str, object]],
-        bounding_box: tuple,
-        black_pattern: Sequence[bool],
-        params: DetectionParameters,
-    ) -> List[Dict[str, object]]:
-        if not white_infos or not black_pattern:
-            return []
-        height, width = gray.shape[:2]
-        bbx, bby, bbw, bbh = bounding_box
-        if bbw <= 0 or bbh <= 0:
-            bbx, bby, bbw, bbh = 0, 0, width, height
-        median_white_width = np.median([info["bbox"][2] for info in white_infos]) if white_infos else 0
-        black_infos: List[Dict[str, object]] = []
-        for idx in range(min(len(white_infos) - 1, len(black_pattern))):
-            if not black_pattern[idx]:
-                continue
-            left = white_infos[idx]
-            right = white_infos[idx + 1]
-            left_bbox = left["bbox"]
-            right_bbox = right["bbox"]
-            left_center = left["center"][0]
-            right_center = right["center"][0]
-            center_x = (left_center + right_center) / 2.0
-            gap = max(right_center - left_center, 1.0)
-            key_width = gap * float(params.black_key_relative_width)
-            if median_white_width > 0:
-                key_width = min(key_width, median_white_width * float(params.black_key_relative_width))
-            half_width = max(key_width / 2.0, 1.0)
-            x_start = int(max(0, center_x - half_width))
-            x_end = int(min(width - 1, center_x + half_width))
-            if x_end <= x_start:
-                continue
-            y_start = int(max(0, bby + params.black_key_vertical_offset * bbh))
-            y_end = int(min(height - 1, bby + bbh * params.black_key_height_ratio))
-            if y_end <= y_start:
-                continue
-            roi = gray[y_start:y_end, x_start:x_end]
-            if roi.size == 0:
-                continue
-            darkness = 1.0 - float(np.mean(roi)) / 255.0
-            if darkness < params.black_key_darkness_threshold:
-                continue
-            _, roi_binary = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-            contours, _ = cv2.findContours(roi_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if contours:
-                contour = max(contours, key=cv2.contourArea)
-                x, y, w, h = cv2.boundingRect(contour)
-                x += x_start
-                y += y_start
-            else:
-                x = x_start
-                y = y_start
-                w = x_end - x_start
-                h = y_end - y_start
-            cx = x + w / 2.0
-            cy = y + h / 2.0
-            confidence = clamp(darkness, 0.0, 1.0)
-            black_infos.append(
-                {
-                    "index": len(black_infos),
-                    "bbox": (int(x), int(y), int(w), int(h)),
-                    "center": (cx, cy),
-                    "normalized_center": normalize_point(cx, cy, bounding_box),
-                    "confidence": confidence,
-                    "source_gap": (left["index"], right["index"]),
+        
+        # Use detected key width to find keys across the full stage2 width
+        height, width = stage2_crop.shape[:2]
+        
+        # Process stage2 crop
+        gray = cv2.cvtColor(stage2_crop, cv2.COLOR_BGR2GRAY)
+        blur_kernel = ensure_odd(int(params.blur_kernel_size))
+        blurred = cv2.GaussianBlur(gray, (blur_kernel, blur_kernel), 0)
+        _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        # Use the detected key width to find regular pattern of white keys
+        keys = []
+        num_expected_keys = max(1, width // detected_key_width)
+        
+        for i in range(num_expected_keys):
+            x_start = i * detected_key_width
+            x_end = min(x_start + detected_key_width, width)
+            
+            if x_end - x_start < detected_key_width * 0.5:  # Skip partial keys at the end
+                break
+            
+            # Check if this region contains enough white pixels
+            region_mask = binary[:, x_start:x_end]
+            white_ratio = np.sum(region_mask > 128) / (region_mask.shape[0] * region_mask.shape[1])
+            
+            if white_ratio > 0.3:  # At least 30% white pixels
+                key_info = {
+                    'bbox': (x_start, 0, x_end - x_start, height),
+                    'center': (x_start + (x_end - x_start) // 2, height // 2),
+                    'confidence': white_ratio,
+                    'area': (x_end - x_start) * height
                 }
-            )
-        return black_infos
+                keys.append(key_info)
+        
+        return keys
 
-    def _compute_confidence(
+    def _create_stage1_visualization(
         self,
-        model: Optional[keyboard_models.KeyboardModel],
-        white_infos: Sequence[Dict[str, object]],
-        black_infos: Sequence[Dict[str, object]],
-    ) -> float:
-        if model:
-            expected_white = max(model.white_keys, 1)
-            expected_black = max(model.black_keys, 1)
-            white_ratio = clamp(len(white_infos) / expected_white, 0.0, 1.0)
-            black_ratio = clamp(len(black_infos) / expected_black, 0.0, 1.0) if model.black_keys else 1.0
-            diff = abs(len(white_infos) - model.white_keys) / expected_white
-            keyboard_conf = clamp(1.0 - diff, 0.0, 1.0)
-            return round((white_ratio * 0.4 + black_ratio * 0.4 + keyboard_conf * 0.2), 4)
-        if not white_infos:
-            return 0.0
-        return round(clamp(0.5 + 0.5 * min(1.0, len(black_infos) / max(len(white_infos) - 1, 1))), 4)
+        stage1_crop: np.ndarray,
+        stage3_white_keys: list,
+        stage2_crop_y_offset: int,
+        stage3_crop_y_offset: int,
+    ) -> np.ndarray:
+        """
+        Create visualization showing detected white key boundaries on the 30% crop (stage1).
+        Boundaries are from stage3 detection but displayed on stage1 image.
+        """
+        # Create a copy of the stage1_crop for visualization
+        vis_image = stage1_crop.copy()
+        
+        # Draw rectangles for each detected white key from stage3
+        for i, key in enumerate(stage3_white_keys):
+            bbox = key['bbox']
+            x, y, w, h = bbox
+            
+            # Adjust coordinates to stage1_crop space
+            # The bbox is relative to stage3_crop, so we need to add both offsets
+            adjusted_y = y + stage2_crop_y_offset + stage3_crop_y_offset
+            
+            # Draw rectangle (green color)
+            cv2.rectangle(vis_image, (x, adjusted_y), (x + w, adjusted_y + h), (0, 255, 0), 2)
+            
+            # Add key number label
+            label = f"Key {i+1}"
+            label_pos = (x + 5, adjusted_y + 20)
+            cv2.putText(vis_image, label, label_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        
+        return vis_image
+

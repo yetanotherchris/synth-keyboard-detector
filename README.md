@@ -1,61 +1,87 @@
-# Piano Key Detector
+# First White Key Detector
 
-`piano-key-detector` is a Python package that detects white and black keys on a top-down photograph of a piano or synthesizer keyboard. It provides a simple API for offline processing and ships with a Streamlit playground for experimenting with detection parameters on custom images.
+A simplified Python package that detects the first (leftmost) white key from top-down keyboard images.
 
-## Installation
+AI/LLMs should always follow the instructions in AGENTS.MD and .github/copilot-instructions.md.
 
+## Quick Start
+
+1. Install requirements:
 ```bash
-Installation
-
-- Option A (editable/development): `pip install -e .`
-- Option B (requirements file): `pip install -r requirements.txt`
-
-Usage
-
-- After installation, import the package in Python:
-  - `from piano_key_detector import detector`
-  - See `tests/test_detector.py` for usage examples.
-
-Notes
-
-- Requires Python >= 3.8.
-- Core dependencies: opencv-python, numpy, pillow, streamlit (see `requirements.txt`).
+pip install -r requirements.txt
 ```
 
-> **Note:** When running in a headless environment (such as CI), you may prefer
-> installing `opencv-python-headless` instead of `opencv-python` to avoid
-> dependency issues with OpenGL libraries.
+2. Run the Streamlit test interface:
+```bash
+streamlit run test_app.py
+```
 
-## Usage
+---
+
+## Package Details
+
+`piano-key-detector` has been simplified to detect only the first (leftmost) white key on a top-down photograph of a piano or synthesizer keyboard. It provides a simple API for offline processing and ships with a Streamlit playground for experimenting with detection parameters on custom images.
+
+### Installation Options
+
+- **Development**: `pip install -e .`
+- **Requirements**: `pip install -r requirements.txt`
+
+### Usage
 
 ```python
 from piano_key_detector import PianoKeyDetector
 
 # Create the detector with default parameters
-_detector = PianoKeyDetector()
+detector = PianoKeyDetector()
 
-# Detect keys from an image path
-result = _detector.detect_keys("path/to/keyboard.jpg")
+# Detect the first white key from an image path
+result = detector.detect_keys("path/to/keyboard.jpg")
 
-print(result["keyboard_type"])  # e.g. "49_key"
-print(len(result["white_keys"]))
-print(len(result["black_keys"]))
+if result["found"]:
+    first_key = result["first_white_key"]
+    print(f"First white key at: {first_key['bbox']}")
+    print(f"Center position: {first_key['center']}")
+    print(f"Confidence: {first_key['confidence']}")
+else:
+    print("No white key detected")
 ```
 
-The detector returns a dictionary containing the keyboard type, bounding box, key locations, and detection confidence. Each key entry includes pixel and normalized positions which makes it easy to map keys back onto the original image.
+The detector returns a dictionary containing:
+- `found`: Boolean indicating if a white key was detected
+- `first_white_key`: Dictionary with key information (if found):
+  - `bbox`: Bounding box (x, y, width, height)
+  - `center`: Center coordinates (x, y)
+  - `confidence`: Detection confidence (0.0 - 1.0)
+  - `aspect_ratio`: Height/width ratio
+  - `area_ratio`: Key area relative to image size
 
-## Streamlit playground
+### Simplified Functionality
 
-A basic Streamlit interface is provided in `test_app.py`. Launch it with:
+This version has been dramatically simplified from the original multi-key detector:
 
-```bash
-streamlit run test_app.py
-```
+**What it does:**
+- Detects the first (leftmost) white key in an image
+- Returns precise bounding box and center coordinates
+- Provides confidence scoring
 
-The app lets you upload an image, tweak detection parameters (Canny thresholds, blur size, etc.), and inspect the intermediate processing steps such as edge detection and binary masks.
+**What it no longer does:**
+- ❌ Keyboard type identification (25-key, 49-key, etc.)
+- ❌ Multiple white key detection
+- ❌ Black key detection
+- ❌ Full keyboard layout analysis
+- ❌ Bottom-half cropping optimization
 
-## Running tests
+### Requirements
 
+- Python >= 3.8
+- Core dependencies: opencv-python, numpy, pillow, streamlit
+
+> **Note:** When running in a headless environment (such as CI), you may prefer installing `opencv-python-headless` instead of `opencv-python` to avoid dependency issues with OpenGL libraries.
+
+### Testing
+
+Run the test suite:
 ```bash
 pytest
 ```

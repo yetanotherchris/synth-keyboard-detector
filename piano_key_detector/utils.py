@@ -96,3 +96,30 @@ def bgr_to_rgb(image: np.ndarray) -> np.ndarray:
     if image.ndim == 2:
         return image
     return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+
+def save_debug_image(image: np.ndarray, filename: str, prefix: str = "debug_") -> str:
+    """Save a debug image to disk for visualization.
+    
+    Parameters
+    ----------
+    image : np.ndarray
+        The image to save (BGR format)
+    filename : str
+        Base filename without extension
+    prefix : str
+        Prefix to add to filename
+        
+    Returns
+    -------
+    str
+        The full path where the image was saved
+    """
+    full_filename = f"{prefix}{filename}.jpg"
+    success = cv2.imwrite(full_filename, image)
+    if success:
+        print(f"Debug image saved: {full_filename}")
+        return full_filename
+    else:
+        print(f"Failed to save debug image: {full_filename}")
+        return ""
