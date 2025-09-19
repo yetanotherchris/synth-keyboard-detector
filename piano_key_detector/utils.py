@@ -115,7 +115,13 @@ def save_debug_image(image: np.ndarray, filename: str, prefix: str = "debug_") -
     str
         The full path where the image was saved
     """
-    full_filename = f"{prefix}{filename}.jpg"
+    import os
+    
+    # Ensure temp directory exists
+    temp_dir = "temp"
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    full_filename = os.path.join(temp_dir, f"{prefix}{filename}.jpg")
     success = cv2.imwrite(full_filename, image)
     if success:
         print(f"Debug image saved: {full_filename}")

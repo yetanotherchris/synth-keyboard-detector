@@ -567,66 +567,111 @@ class PianoKeyDetector:
 
     def _find_all_white_keys(self, white_keys_image: np.ndarray, params: DetectionParameters) -> list[Dict[str, object]]:
         """
-        Find all white keys in the image using precise edge detection for each key boundary.
-        This method detects the actual separations between keys instead of using uniform spacing.
+        Find all white keys using uniform spacing pattern based on actual image analysis.
+        This method uses the discovered pattern: 8px key width + 2px separator = 10px spacing.
         Returns a list of key dictionaries with position and dimensions.
         """
         height, width = white_keys_image.shape[:2]
         gray = cv2.cvtColor(white_keys_image, cv2.COLOR_BGR2GRAY)
         
-        # Apply preprocessing
-        blur_kernel = ensure_odd(int(params.blur_kernel_size))
-        blurred = cv2.GaussianBlur(gray, (blur_kernel, blur_kernel), 0)
+        # Based on analysis: uniform pattern is ~8px key + ~2px separator
+        # But we need to determine the actual pattern from the image
         
-        # Use edge detection to find key boundaries
-        edges = cv2.Canny(blurred, int(params.canny_low), int(params.canny_high))
+        # Calculate column projection to determine actual spacing
+        column_projection = np.mean(gray, axis=0)
+        dark_threshold = column_projection.mean() - column_projection.std() * 0.5
         
-        # Find all vertical edges that could be key separators
-        key_boundaries = self._find_all_key_boundaries(edges, width, height)
+        # Identify regions and calculate average spacing
+        transitions = []
+        in_white_key = column_projection[0] > dark_threshold
+        current_region_start = 0
         
-        # Convert boundaries to key regions
+        for x in range(1, len(column_projection)):
+            is_white = column_projection[x] > dark_threshold
+            
+            if is_white != in_white_key:
+                region_width = x - current_region_start
+                region_type = "white_key" if in_white_key else "separator"
+                transitions.append({
+                    "start": current_region_start,
+                    "end": x,
+                    "width": region_width,
+                    "type": region_type
+                })
+                current_region_start = x
+                in_white_key = is_white
+        
+        # Add final region
+        if current_region_start < len(column_projection):
+            region_width = len(column_projection) - current_region_start
+            region_type = "white_key" if in_white_key else "separator"
+            transitions.append({
+                "start": current_region_start,
+                "end": len(column_projection),
+                "width": region_width,
+                "type": region_type
+            })
+        
+        # Calculate uniform dimensions from detected patterns
+        white_key_widths = [t["width"] for t in transitions if t["type"] == "white_key"]
+        separator_widths = [t["width"] for t in transitions if t["type"] == "separator"]
+        
+        if not white_key_widths:
+            return []
+        
+        # Use the most common widths or averages for uniform spacing
+        uniform_key_width = round(np.mean(white_key_widths))
+        uniform_separator_width = round(np.mean(separator_widths)) if separator_widths else 2
+        uniform_spacing = uniform_key_width + uniform_separator_width
+        
+        print(f"Detected uniform pattern: {uniform_key_width}px key + {uniform_separator_width}px separator = {uniform_spacing}px spacing")
+        
+        # Generate keys using uniform spacing, starting from the actual detected pattern
         keys = []
         key_index = 0
         
-        # Add the leftmost boundary (start of image) if not already present
-        if not key_boundaries or key_boundaries[0] > 5:
-            key_boundaries.insert(0, 0)
+        # Find the first white key region to establish the starting point
+        first_white_start = None
+        for t in transitions:
+            if t["type"] == "white_key":
+                first_white_start = t["start"]
+                break
         
-        # Add the rightmost boundary (end of image) if not already present
-        if not key_boundaries or key_boundaries[-1] < width - 5:
-            key_boundaries.append(width)
+        if first_white_start is None:
+            first_white_start = 0
         
-        # Create keys from consecutive boundaries
-        for i in range(len(key_boundaries) - 1):
-            x_start = key_boundaries[i]
-            x_end = key_boundaries[i + 1]
-            key_width = x_end - x_start
+        # Generate uniform keys across the entire width
+        x_position = first_white_start
+        
+        while x_position + uniform_key_width <= width:
+            # Ensure we're still in a reasonable key area (check brightness)
+            key_region_x_end = min(x_position + uniform_key_width, width)
+            key_region = gray[:, x_position:key_region_x_end]
             
-            # Validate minimum key width
-            min_key_width = max(int(width * params.min_white_key_width_ratio), 5)
-            max_key_width = int(width * params.max_white_key_width_ratio)
-            
-            if min_key_width <= key_width <= max_key_width:
-                # Fine-tune the right boundary using existing method
-                true_right_x = self._find_true_right_boundary(white_keys_image, x_start, x_end)
-                final_width = true_right_x - x_start
+            if key_region.size > 0:
+                avg_brightness = np.mean(key_region)
                 
-                if final_width >= min_key_width:
+                # Only create key if the region is reasonably bright (indicating white key)
+                if avg_brightness > column_projection.mean() * 0.8:  # At least 80% of average brightness
                     # Calculate key properties
-                    cx = x_start + final_width / 2.0
+                    cx = x_position + uniform_key_width / 2.0
                     cy = height / 2.0
-                    aspect = height / float(max(final_width, 1))
-                    area_ratio = (final_width * height) / float(width * height)
+                    aspect = height / float(max(uniform_key_width, 1))
+                    area_ratio = (uniform_key_width * height) / float(width * height)
                     
-                    # Calculate confidence based on key properties
+                    # Calculate confidence based on brightness and position consistency
                     confidence = 1.0
                     if aspect < params.min_white_key_aspect:
-                        confidence *= 0.8
+                        confidence *= 0.9
                     if area_ratio < params.min_white_key_area_ratio:
-                        confidence *= 0.8
+                        confidence *= 0.9
+                    
+                    # Boost confidence for good brightness
+                    if avg_brightness > column_projection.mean():
+                        confidence = min(1.0, confidence * 1.1)
                     
                     key_info = {
-                        "bbox": (x_start, 0, final_width, height),
+                        "bbox": (x_position, 0, uniform_key_width, height),
                         "center": (cx, cy),
                         "confidence": confidence,
                         "aspect_ratio": aspect,
@@ -635,12 +680,11 @@ class PianoKeyDetector:
                     }
                     keys.append(key_info)
                     key_index += 1
+            
+            # Move to next key position using uniform spacing
+            x_position += uniform_spacing
         
-        # If no keys found with edge detection, fallback to the original method
-        if not keys:
-            first_key = self._find_first_white_key_exact(white_keys_image, params)
-            if first_key is not None:
-                keys = [first_key]
+        print(f"Generated {len(keys)} uniform keys with {uniform_key_width}px width")
         
         return keys
 
