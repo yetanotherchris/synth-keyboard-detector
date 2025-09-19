@@ -562,7 +562,7 @@ class PianoKeyDetector:
 
     def _save_white_keys_to_json(self, white_keys: list[Dict[str, object]], filename: str = "white-keys.json") -> None:
         """
-        Save detected white keys coordinates and dimensions to a JSON file.
+        Save detected white keys coordinates, dimensions, and color information to a JSON file.
         
         Args:
             white_keys: List of detected white key dictionaries
@@ -572,7 +572,7 @@ class PianoKeyDetector:
         temp_dir = "temp"
         os.makedirs(temp_dir, exist_ok=True)
         
-        # Prepare data for JSON export (coordinates and dimensions only)
+        # Prepare data for JSON export (coordinates, dimensions, and colors)
         json_data = {
             "white_keys": [],
             "total_keys": len(white_keys),
@@ -581,6 +581,8 @@ class PianoKeyDetector:
         
         for i, key in enumerate(white_keys):
             bbox = key["bbox"]
+            colors = key.get("colors", {})
+            
             key_data = {
                 "key_index": i,
                 "x": bbox[0],
@@ -588,7 +590,13 @@ class PianoKeyDetector:
                 "width": bbox[2],
                 "height": bbox[3],
                 "center_x": key["center"][0],
-                "center_y": key["center"][1]
+                "center_y": key["center"][1],
+                "colors": {
+                    "min_color": colors.get("min_color", 0),
+                    "max_color": colors.get("max_color", 255),
+                    "avg_color": colors.get("avg_color", 128),
+                    "std_color": colors.get("std_color", 0)
+                }
             }
             json_data["white_keys"].append(key_data)
         
@@ -597,188 +605,146 @@ class PianoKeyDetector:
         with open(json_path, 'w') as f:
             json.dump(json_data, f, indent=2)
         
-        print(f"White keys data saved to {json_path}")
+        print(f"White keys data with color information saved to {json_path}")
 
-    def _find_darkest_boundary_color(self, gray_image: np.ndarray) -> float:
+    def _find_darkest_boundary_color(self, gray_image: np.ndarray) -> Tuple[float, float]:
         """
-        Find the darkest color/grey value in the image that represents boundaries between white keys.
-        This method analyzes the image to identify the darkest regions that consistently appear
-        as separators between white keys.
+        Find the actual separator and white key colors using pure color analysis.
+        Analyzes column-wise patterns to identify the true white vs separator colors.
         
         Returns:
-            The darkest color value (0-255) that represents key boundaries
+            Tuple of (separator_color, white_key_color) - the actual grey values
         """
         height, width = gray_image.shape
         
-        # Calculate column-wise minimum values to find darkest areas in each column
-        column_mins = np.min(gray_image, axis=0)
+        # Calculate column averages to see the actual color pattern
+        column_averages = np.mean(gray_image, axis=0)
         
-        # Calculate row-wise minimums to find darkest areas in each row  
-        row_mins = np.min(gray_image, axis=1)
+        # Find the darkest columns (separators) and brightest columns (white keys)
+        separator_threshold = np.percentile(column_averages, 25)  # Bottom 25% are separators
+        white_key_threshold = np.percentile(column_averages, 75)  # Top 25% are white keys
         
-        # Find the global minimum (darkest pixel in entire image)
-        global_min = np.min(gray_image)
+        # Extract actual separator and white key pixel values
+        separator_columns = column_averages <= separator_threshold
+        white_key_columns = column_averages >= white_key_threshold
         
-        # Look for consistent dark values that appear frequently (likely separators)
-        # Create histogram of the darkest 10% of pixels
-        dark_pixels = gray_image[gray_image <= np.percentile(gray_image, 10)]
-        
-        if len(dark_pixels) == 0:
-            # Fallback to global minimum if no dark pixels found
-            darkest_boundary = global_min
+        if np.any(separator_columns):
+            # Get average color of actual separator pixels
+            separator_pixels = gray_image[:, separator_columns]
+            separator_color = np.mean(separator_pixels)
         else:
-            # Find the most common dark value (mode of darkest pixels)
-            hist, bins = np.histogram(dark_pixels, bins=50)
-            most_common_dark_idx = np.argmax(hist)
-            darkest_boundary = bins[most_common_dark_idx]
+            separator_color = np.min(column_averages)
         
-        # Ensure we have a reasonable boundary value
-        # If the darkest value is too close to white, use a more conservative approach
-        if darkest_boundary > 200:  # Very bright "dark" areas
-            # Use a more aggressive approach - find the darkest 5% average
-            darkest_boundary = np.mean(gray_image[gray_image <= np.percentile(gray_image, 5)])
+        if np.any(white_key_columns):
+            # Get average color of actual white key pixels
+            white_key_pixels = gray_image[:, white_key_columns]
+            white_key_color = np.mean(white_key_pixels)
+        else:
+            white_key_color = np.max(column_averages)
         
-        print(f"Detected darkest boundary color: {darkest_boundary:.1f} (global min: {global_min})")
+        print(f"Detected separator color: {separator_color:.1f}, white key color: {white_key_color:.1f}")
         
-        return float(darkest_boundary)
+        return float(separator_color), float(white_key_color)
 
     def _find_all_white_keys(self, white_keys_image: np.ndarray, params: DetectionParameters) -> list[Dict[str, object]]:
         """
-        Find all white keys using darkest color boundary detection.
-        This method finds the darkest color/grey values that represent boundaries between white keys,
-        and considers all non-darkest colors as valid parts of white keys.
-        Returns a list of key dictionaries with position and dimensions.
+        Find all white keys using pure color analysis rather than thresholds.
+        Identifies the actual colors of separators and white keys, then uses these
+        to precisely measure each white key's width and record its color information.
         """
         height, width = white_keys_image.shape[:2]
         gray = cv2.cvtColor(white_keys_image, cv2.COLOR_BGR2GRAY)
         
-        # Find the darkest color in the image that represents key boundaries
-        darkest_value = self._find_darkest_boundary_color(gray)
+        # Get the actual separator and white key colors from the image
+        separator_color, white_key_color = self._find_darkest_boundary_color(gray)
         
-        # Calculate column projection to determine actual spacing
-        column_projection = np.mean(gray, axis=0)
+        # Calculate column averages to analyze the pattern
+        column_averages = np.mean(gray, axis=0)
         
-        # Use darkest color as the boundary threshold - anything significantly darker than average is a separator
-        # Allow some tolerance to account for variations in separator darkness
-        boundary_threshold = darkest_value + (darkest_value * 0.2)  # 20% tolerance above darkest
+        # Use the midpoint between separator and white key colors as the boundary
+        color_midpoint = (separator_color + white_key_color) / 2
         
-        # Identify regions using the darkest color boundaries
+        print(f"Using color midpoint {color_midpoint:.1f} to separate keys from separators")
+        
+        # Identify all transitions between white keys and separators
+        is_white_key = column_averages > color_midpoint
         transitions = []
-        in_white_key = column_projection[0] > boundary_threshold
-        current_region_start = 0
+        current_state = is_white_key[0]
+        region_start = 0
         
-        for x in range(1, len(column_projection)):
-            is_white = column_projection[x] > boundary_threshold
-            
-            if is_white != in_white_key:
-                region_width = x - current_region_start
-                region_type = "white_key" if in_white_key else "separator"
+        for x in range(1, len(column_averages)):
+            if is_white_key[x] != current_state:
+                # State changed - record the previous region
+                region_type = "white_key" if current_state else "separator"
                 transitions.append({
-                    "start": current_region_start,
+                    "start": region_start,
                     "end": x,
-                    "width": region_width,
-                    "type": region_type
+                    "width": x - region_start,
+                    "type": region_type,
+                    "avg_color": np.mean(column_averages[region_start:x])
                 })
-                current_region_start = x
-                in_white_key = is_white
+                region_start = x
+                current_state = is_white_key[x]
         
-        # Add final region
-        if current_region_start < len(column_projection):
-            region_width = len(column_projection) - current_region_start
-            region_type = "white_key" if in_white_key else "separator"
+        # Add the final region
+        if region_start < len(column_averages):
+            region_type = "white_key" if current_state else "separator"
             transitions.append({
-                "start": current_region_start,
-                "end": len(column_projection),
-                "width": region_width,
-                "type": region_type
+                "start": region_start,
+                "end": len(column_averages),
+                "width": len(column_averages) - region_start,
+                "type": region_type,
+                "avg_color": np.mean(column_averages[region_start:len(column_averages)])
             })
         
-        # Calculate uniform dimensions from detected patterns
-        white_key_widths = [t["width"] for t in transitions if t["type"] == "white_key"]
-        separator_widths = [t["width"] for t in transitions if t["type"] == "separator"]
-        
-        if not white_key_widths:
-            return []
-        
-        # Use the most common widths or averages for uniform sizing
-        # Key width should ONLY be the white portion, excluding grey separators
-        uniform_key_width = round(np.mean(white_key_widths))
-        uniform_separator_width = round(np.mean(separator_widths)) if separator_widths else 2
-        uniform_spacing = uniform_key_width + uniform_separator_width
-        
-        print(f"Using darkest boundary detection (value: {darkest_value:.1f}, threshold: {boundary_threshold:.1f})")
-        print(f"Detected uniform pattern: {uniform_key_width}px key + {uniform_separator_width}px separator = {uniform_spacing}px spacing")
-        
-        # Generate keys using uniform spacing, starting from the actual detected pattern
+        # Extract only the white key regions with their actual measured widths
         keys = []
         key_index = 0
         
-        # Find the first white key region to establish the starting point
-        first_white_start = None
-        for t in transitions:
-            if t["type"] == "white_key":
-                first_white_start = t["start"]
-                break
-        
-        if first_white_start is None:
-            first_white_start = 0
-        
-        # Generate uniform keys across the entire width
-        # Each key starts at a white pixel and has width equal to only the white portion
-        x_position = first_white_start
-        
-        while x_position + uniform_key_width <= width:
-            # Find the actual start of white pixels at this position
-            actual_key_start = self._find_first_white_pixel(gray, x_position, x_position + uniform_spacing, boundary_threshold)
-            
-            if actual_key_start is None:
-                # No white pixel found, move to next position
-                x_position += uniform_spacing
-                continue
-            
-            # Ensure we're still in a reasonable key area (check brightness relative to darkest boundary)
-            key_region_x_end = min(actual_key_start + uniform_key_width, width)
-            key_region = gray[:, actual_key_start:key_region_x_end]
-            
-            if key_region.size > 0:
-                avg_brightness = np.mean(key_region)
+        for region in transitions:
+            if region["type"] == "white_key":
+                x_start = region["start"]
+                x_end = region["end"]
+                actual_width = region["width"]
                 
-                # Only create key if the region is significantly brighter than the darkest boundary
-                # This ensures we're detecting actual white key regions, not separator regions
-                if avg_brightness > boundary_threshold:  # Must be brighter than boundary threshold
-                    # Calculate key properties using only the white key portion
-                    cx = actual_key_start + uniform_key_width / 2.0
-                    cy = height / 2.0
-                    aspect = height / float(max(uniform_key_width, 1))
-                    area_ratio = (uniform_key_width * height) / float(width * height)
-                    
-                    # Calculate confidence based on brightness and position consistency
-                    confidence = 1.0
-                    if aspect < params.min_white_key_aspect:
-                        confidence *= 0.9
-                    if area_ratio < params.min_white_key_area_ratio:
-                        confidence *= 0.9
-                    
-                    # Boost confidence for good brightness relative to boundary
-                    brightness_ratio = avg_brightness / max(boundary_threshold, 1)
-                    if brightness_ratio > 1.5:  # Significantly brighter than boundary
-                        confidence = min(1.0, confidence * 1.2)
-                    
-                    key_info = {
-                        "bbox": (actual_key_start, 0, uniform_key_width, height),
-                        "center": (cx, cy),
-                        "confidence": confidence,
-                        "aspect_ratio": aspect,
-                        "area_ratio": area_ratio,
-                        "key_index": key_index,
-                    }
-                    keys.append(key_info)
-                    key_index += 1
-            
-            # Move to next key position using uniform spacing
-            x_position += uniform_spacing
+                # Calculate center and dimensions
+                cx = x_start + actual_width / 2.0
+                cy = height / 2.0
+                aspect = height / float(max(actual_width, 1))
+                area_ratio = (actual_width * height) / float(width * height)
+                
+                # Calculate confidence based on how well this matches expected white key properties
+                confidence = 1.0
+                if aspect < params.min_white_key_aspect:
+                    confidence *= 0.9
+                if area_ratio < params.min_white_key_area_ratio:
+                    confidence *= 0.9
+                
+                # Extract actual color information for this specific key
+                key_region = gray[:, x_start:x_end]
+                key_colors = {
+                    "min_color": float(np.min(key_region)),
+                    "max_color": float(np.max(key_region)),
+                    "avg_color": float(np.mean(key_region)),
+                    "std_color": float(np.std(key_region))
+                }
+                
+                key_info = {
+                    "bbox": (x_start, 0, actual_width, height),
+                    "center": (cx, cy),
+                    "confidence": confidence,
+                    "aspect_ratio": aspect,
+                    "area_ratio": area_ratio,
+                    "key_index": key_index,
+                    "colors": key_colors  # NEW: actual color information for this key
+                }
+                keys.append(key_info)
+                key_index += 1
         
-        print(f"Generated {len(keys)} uniform keys with {uniform_key_width}px width")
+        print(f"Detected {len(keys)} white keys with color-based analysis")
+        if keys:
+            widths = [key["bbox"][2] for key in keys]
+            print(f"Key widths: min={min(widths)}, max={max(widths)}, avg={np.mean(widths):.1f}")
         
         return keys
 

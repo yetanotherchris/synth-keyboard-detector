@@ -1,0 +1,3 @@
+1. The 2px separator width comes from actually measuring the dark/grey regions between white keys in the image and finding that they consistently measure about 2 pixels wide. The algorithm doesn't assume 2px - it discovers this pattern by analyzing the actual brightness transitions in the piano image.
+2. The algorithm should find the darkest colour (e.g. darkest grey), and use this as the boundary between white keys. All other none-white colours can be seen to be valid parts of the white key.
+3. Update the detection algorithm for this change.

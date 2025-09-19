@@ -1,0 +1,1 @@
+AI code generators such as Copilot, Claude, Codex, Replit should ignore all files in this directory.
