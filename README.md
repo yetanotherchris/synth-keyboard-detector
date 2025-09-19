@@ -1,6 +1,7 @@
 # First White Key Detector
-A simplified Python package that detects the first (leftmost) white key from top-down keyboard images.
+Detects the keys (currently just white keys) from top-down keyboard images, like those found in Synthesia videos on youtube.
 
+Video downloading and frame capturing coming next...
 
 ![output](./output-example.png)
 
