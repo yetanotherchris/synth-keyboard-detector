@@ -9,6 +9,6 @@ You should think about edge cases and ask questions before continuing, to ensure
 
 Provide an initial summary of the work you are about to do, the tasks you believe you need to carry out. Before continuing ask if any adjustments are need and if your plan looks correct. Wait for a response.
 
-You should always delete any temporary files including test scripts you have generated after finishing your work.
+You should always delete any temporary files. including test scripts you have generated after finishing your work.
 
 When you have finished, provide a one paragraph summary, no emojis or bullet points.

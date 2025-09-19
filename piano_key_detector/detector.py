@@ -1,6 +1,8 @@
 """Piano key detection implementation following first-steps.md exactly."""
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -35,6 +37,18 @@ class DetectionParameters:
 
 class PianoKeyDetector:
     """Detect piano keys following the exact process from first-steps.md."""
+
+    # Primary and secondary colors for key highlighting (BGR format for OpenCV)
+    KEY_COLORS = [
+        (0, 255, 0),      # Green (primary)
+        (0, 0, 255),      # Red (primary)  
+        (255, 0, 0),      # Blue (primary)
+        (0, 255, 255),    # Yellow (secondary)
+        (255, 255, 0),    # Cyan (secondary)
+        (255, 0, 255),    # Magenta (secondary)
+        (0, 165, 255),    # Orange (secondary)
+        (128, 0, 128),    # Purple (tertiary)
+    ]
 
     def __init__(self, **kwargs):
         self.params = DetectionParameters(**kwargs)
@@ -98,40 +112,49 @@ class PianoKeyDetector:
         # Stage 5: You should have the white keys only now
         # This is our final white keys image
         
-        # Stage 6: Find the first white key and create overlay
-        first_white_key = self._find_first_white_key_exact(stage4_crop, params)
+        # Stage 6-7: Find all white keys and create multi-color overlays
+        all_white_keys = self._find_all_white_keys(stage4_crop, params)
         
-        # Create highlighted images (stage 6 only)
+        # Save white keys to JSON file
+        if all_white_keys:
+            self._save_white_keys_to_json(all_white_keys)
+        
+        # Create highlighted images (stages 6-7)
+        stage7_highlighted = None
         stage6_highlighted = None
-        stage3_highlighted = None
         
-        if first_white_key is not None:
-            # Stage 6: Highlight first key in green with 50% opacity solid fill
-            stage6_highlighted = self._create_green_solid_overlay(stage4_crop, first_white_key)
+        if all_white_keys:
+            # Stage 7: Multi-color overlay on white keys only image
+            stage7_highlighted = self._create_multi_color_overlay(stage4_crop, all_white_keys)
             
-            # Create highlighted Stage 3 image using the width information
-            stage3_highlighted = self._create_stage3_highlighting(stage3_crop, first_white_key, stage4_crop_y)
+            # Stage 6: Multi-color overlay on full keyboard image
+            stage6_highlighted = self._create_stage3_highlighting(stage3_crop, all_white_keys, stage4_crop_y)
         
         # Convert coordinates back to original image space for API compatibility
         white_keys = []
-        if first_white_key is not None:
+        if all_white_keys:
             # Calculate total offset from original image
             total_y_offset = stage1_crop_y + stage3_crop_y_offset + stage4_crop_y
             
-            bbox = first_white_key["bbox"]
-            x, y, w, h = bbox
-            
-            # Transform to original image coordinates
-            original_bbox = (x, y + total_y_offset, w, h)
-            
-            white_key_entry = {
-                "bbox": original_bbox,
-                "center": (x + w/2, y + total_y_offset + h/2),
-                "confidence": first_white_key["confidence"],
-                "aspect_ratio": first_white_key.get("aspect_ratio", 0),
-                "area_ratio": first_white_key.get("area_ratio", 0),
-            }
-            white_keys.append(white_key_entry)
+            for key_info in all_white_keys:
+                bbox = key_info["bbox"]
+                x, y, w, h = bbox
+                
+                # Transform to original image coordinates
+                original_bbox = (x, y + total_y_offset, w, h)
+                
+                white_key_entry = {
+                    "bbox": original_bbox,
+                    "center": (x + w/2, y + total_y_offset + h/2),
+                    "confidence": key_info["confidence"],
+                    "aspect_ratio": key_info.get("aspect_ratio", 0),
+                    "area_ratio": key_info.get("area_ratio", 0),
+                    "key_index": key_info.get("key_index", 0),
+                }
+                white_keys.append(white_key_entry)
+
+        # For backward compatibility, keep first_white_key reference
+        first_white_key = all_white_keys[0] if all_white_keys else None
 
         result: Dict[str, object] = {
             "white_keys": white_keys,
@@ -146,23 +169,24 @@ class PianoKeyDetector:
         }
 
         if debug:
-            # Save all processing stages
-            save_debug_image(stage1_crop, "stage1_bottom_50_percent")
+            # Save all processing stages with new numbering scheme
+            # Stage 1: Original image (handled by caller)
+            save_debug_image(stage1_crop, "stage2_crop_bottom_50_percent")
             save_debug_image(stage3_crop, "stage3_keyboard_height")
             save_debug_image(stage4_crop, "stage4_white_keys_only")
             
+            if stage7_highlighted is not None:
+                save_debug_image(stage7_highlighted, "stage7_multi_color_overlay")
             if stage6_highlighted is not None:
-                save_debug_image(stage6_highlighted, "stage6_green_solid")
-            if stage3_highlighted is not None:
-                save_debug_image(stage3_highlighted, "stage3_highlighted")
+                save_debug_image(stage6_highlighted, "stage6_full_keyboard_highlighted")
             
             result["debug"] = {
                 "original": image_bgr,
-                "stage1_crop": stage1_crop,  # Bottom 50%
+                "stage2_crop": stage1_crop,  # Crop bottom 50%
                 "stage3_crop": stage3_crop,  # Keyboard height  
-                "stage3_highlighted": stage3_highlighted,  # Keyboard height with first key highlighted
+                "stage6_highlighted": stage6_highlighted,  # Full keyboard with keys highlighted
                 "stage4_crop": stage4_crop,  # White keys only (bottom 30%)
-                "stage6_highlighted": stage6_highlighted,  # Green solid overlay
+                "stage7_highlighted": stage7_highlighted,  # Multi-color overlay
                 "white_keys_region": white_keys_region,
             }
 
@@ -472,66 +496,220 @@ class PianoKeyDetector:
         
         return min(true_right, x_end)  # Don't exceed original detection
 
-    def _create_stage3_highlighting(self, stage3_image: np.ndarray, key_info: Dict[str, object], stage4_y_offset: int) -> np.ndarray:
+    def _find_all_key_boundaries(self, edges: np.ndarray, width: int, height: int) -> list[int]:
         """
-        Create solid green overlay on Stage 3 image using the first white key width information.
+        Find all vertical boundaries that separate white keys using edge detection.
+        Returns a sorted list of x-coordinates where key boundaries are detected.
+        """
+        boundaries = []
+        
+        # Parameters for boundary detection
+        min_edge_strength = height * 0.15  # Minimum vertical edge strength
+        min_key_width = max(width // 20, 8)  # Minimum distance between boundaries
+        
+        # Scan for vertical edges across the width
+        for x in range(min_key_width, width - min_key_width):
+            # Count vertical edge pixels in this column
+            edge_count = np.sum(edges[:, x] > 0)
+            
+            # Check if this column has strong vertical edges
+            if edge_count >= min_edge_strength:
+                # Ensure minimum distance from previous boundary
+                if not boundaries or x - boundaries[-1] >= min_key_width:
+                    boundaries.append(x)
+        
+        # Clean up boundaries that are too close together
+        cleaned_boundaries = []
+        for boundary in boundaries:
+            if not cleaned_boundaries or boundary - cleaned_boundaries[-1] >= min_key_width:
+                cleaned_boundaries.append(boundary)
+        
+        return cleaned_boundaries
+
+    def _save_white_keys_to_json(self, white_keys: list[Dict[str, object]], filename: str = "white-keys.json") -> None:
+        """
+        Save detected white keys coordinates and dimensions to a JSON file.
+        
+        Args:
+            white_keys: List of detected white key dictionaries
+            filename: Name of the JSON file to save (defaults to "white-keys.json")
+        """
+        # Create temp directory if it doesn't exist
+        temp_dir = "temp"
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        # Prepare data for JSON export (coordinates and dimensions only)
+        json_data = {
+            "white_keys": [],
+            "total_keys": len(white_keys),
+            "detection_timestamp": "2025-09-19"  # Could be made dynamic if needed
+        }
+        
+        for i, key in enumerate(white_keys):
+            bbox = key["bbox"]
+            key_data = {
+                "key_index": i,
+                "x": bbox[0],
+                "y": bbox[1], 
+                "width": bbox[2],
+                "height": bbox[3],
+                "center_x": key["center"][0],
+                "center_y": key["center"][1]
+            }
+            json_data["white_keys"].append(key_data)
+        
+        # Save to JSON file
+        json_path = os.path.join(temp_dir, filename)
+        with open(json_path, 'w') as f:
+            json.dump(json_data, f, indent=2)
+        
+        print(f"White keys data saved to {json_path}")
+
+    def _find_all_white_keys(self, white_keys_image: np.ndarray, params: DetectionParameters) -> list[Dict[str, object]]:
+        """
+        Find all white keys in the image using precise edge detection for each key boundary.
+        This method detects the actual separations between keys instead of using uniform spacing.
+        Returns a list of key dictionaries with position and dimensions.
+        """
+        height, width = white_keys_image.shape[:2]
+        gray = cv2.cvtColor(white_keys_image, cv2.COLOR_BGR2GRAY)
+        
+        # Apply preprocessing
+        blur_kernel = ensure_odd(int(params.blur_kernel_size))
+        blurred = cv2.GaussianBlur(gray, (blur_kernel, blur_kernel), 0)
+        
+        # Use edge detection to find key boundaries
+        edges = cv2.Canny(blurred, int(params.canny_low), int(params.canny_high))
+        
+        # Find all vertical edges that could be key separators
+        key_boundaries = self._find_all_key_boundaries(edges, width, height)
+        
+        # Convert boundaries to key regions
+        keys = []
+        key_index = 0
+        
+        # Add the leftmost boundary (start of image) if not already present
+        if not key_boundaries or key_boundaries[0] > 5:
+            key_boundaries.insert(0, 0)
+        
+        # Add the rightmost boundary (end of image) if not already present
+        if not key_boundaries or key_boundaries[-1] < width - 5:
+            key_boundaries.append(width)
+        
+        # Create keys from consecutive boundaries
+        for i in range(len(key_boundaries) - 1):
+            x_start = key_boundaries[i]
+            x_end = key_boundaries[i + 1]
+            key_width = x_end - x_start
+            
+            # Validate minimum key width
+            min_key_width = max(int(width * params.min_white_key_width_ratio), 5)
+            max_key_width = int(width * params.max_white_key_width_ratio)
+            
+            if min_key_width <= key_width <= max_key_width:
+                # Fine-tune the right boundary using existing method
+                true_right_x = self._find_true_right_boundary(white_keys_image, x_start, x_end)
+                final_width = true_right_x - x_start
+                
+                if final_width >= min_key_width:
+                    # Calculate key properties
+                    cx = x_start + final_width / 2.0
+                    cy = height / 2.0
+                    aspect = height / float(max(final_width, 1))
+                    area_ratio = (final_width * height) / float(width * height)
+                    
+                    # Calculate confidence based on key properties
+                    confidence = 1.0
+                    if aspect < params.min_white_key_aspect:
+                        confidence *= 0.8
+                    if area_ratio < params.min_white_key_area_ratio:
+                        confidence *= 0.8
+                    
+                    key_info = {
+                        "bbox": (x_start, 0, final_width, height),
+                        "center": (cx, cy),
+                        "confidence": confidence,
+                        "aspect_ratio": aspect,
+                        "area_ratio": area_ratio,
+                        "key_index": key_index,
+                    }
+                    keys.append(key_info)
+                    key_index += 1
+        
+        # If no keys found with edge detection, fallback to the original method
+        if not keys:
+            first_key = self._find_first_white_key_exact(white_keys_image, params)
+            if first_key is not None:
+                keys = [first_key]
+        
+        return keys
+
+    def _create_stage3_highlighting(self, stage3_image: np.ndarray, all_keys: list[Dict[str, object]], stage4_y_offset: int) -> np.ndarray:
+        """
+        Create multi-color overlay on Stage 3 image using all detected white keys.
         
         Args:
             stage3_image: The Stage 3 cropped image (keyboard height)
-            key_info: Key information detected from Stage 4 
+            all_keys: List of all detected keys with position information
             stage4_y_offset: Y offset where Stage 4 starts within Stage 3
         """
         overlay = stage3_image.copy()
-        bbox = key_info["bbox"]
-        x, y, w, h = bbox
         
-        # Calculate the position in Stage 3 coordinates
-        # X position remains the same since we only cropped vertically
-        stage3_x = x
-        stage3_y = stage4_y_offset + y  # Add the vertical offset
-        stage3_w = w
-        
-        # Calculate height for Stage 3 - extend to full keyboard height
-        stage3_h = stage3_image.shape[0] - stage3_y
-        
-        # Ensure we don't go outside image bounds
-        if stage3_y >= stage3_image.shape[0] or stage3_x >= stage3_image.shape[1]:
-            return overlay
+        for key_info in all_keys:
+            bbox = key_info["bbox"]
+            x, y, w, h = bbox
+            key_index = key_info.get("key_index", 0)
             
-        if stage3_x + stage3_w > stage3_image.shape[1]:
-            stage3_w = stage3_image.shape[1] - stage3_x
+            # Get color for this key (cycling through the palette)
+            color = self.KEY_COLORS[key_index % len(self.KEY_COLORS)]
             
-        if stage3_y + stage3_h > stage3_image.shape[0]:
+            # Calculate the position in Stage 3 coordinates
+            stage3_x = x
+            stage3_y = stage4_y_offset + y
+            stage3_w = w
             stage3_h = stage3_image.shape[0] - stage3_y
+            
+            # Ensure we don't go outside image bounds
+            if stage3_y >= stage3_image.shape[0] or stage3_x >= stage3_image.shape[1]:
+                continue
+                
+            if stage3_x + stage3_w > stage3_image.shape[1]:
+                stage3_w = stage3_image.shape[1] - stage3_x
+                
+            if stage3_y + stage3_h > stage3_image.shape[0]:
+                stage3_h = stage3_image.shape[0] - stage3_y
+            
+            # Create colored overlay
+            colored_overlay = overlay.copy()
+            cv2.rectangle(colored_overlay, (stage3_x, stage3_y), (stage3_x + stage3_w, stage3_y + stage3_h), color, -1)
+            
+            # Apply 50% opacity blending
+            alpha = 0.5
+            overlay = cv2.addWeighted(overlay, 1 - alpha, colored_overlay, alpha, 0)
         
-        # Create green overlay with solid fill
-        green_overlay = overlay.copy()
-        
-        # Fill the key area with solid green
-        cv2.rectangle(green_overlay, (stage3_x, stage3_y), (stage3_x + stage3_w, stage3_y + stage3_h), (0, 255, 0), -1)
-        
-        # Apply 50% opacity blending
-        alpha = 0.5
-        result = cv2.addWeighted(overlay, 1 - alpha, green_overlay, alpha, 0)
-        
-        return result
+        return overlay
 
-    def _create_green_solid_overlay(self, image: np.ndarray, key_info: Dict[str, object]) -> np.ndarray:
+    def _create_multi_color_overlay(self, image: np.ndarray, all_keys: list[Dict[str, object]]) -> np.ndarray:
         """
-        Create solid green overlay with 50% opacity on the first white key.
+        Create multi-color overlay with 50% opacity on all detected white keys.
+        Each key gets a different color from the predefined palette.
         """
         overlay = image.copy()
-        bbox = key_info["bbox"]
-        x, y, w, h = bbox
         
-        # Create green overlay with solid fill
-        green_overlay = overlay.copy()
+        for key_info in all_keys:
+            bbox = key_info["bbox"]
+            x, y, w, h = bbox
+            key_index = key_info.get("key_index", 0)
+            
+            # Get color for this key (cycling through the palette)
+            color = self.KEY_COLORS[key_index % len(self.KEY_COLORS)]
+            
+            # Create colored overlay
+            colored_overlay = overlay.copy()
+            cv2.rectangle(colored_overlay, (x, y), (x + w, y + h), color, -1)
+            
+            # Apply 50% opacity blending
+            alpha = 0.5
+            overlay = cv2.addWeighted(overlay, 1 - alpha, colored_overlay, alpha, 0)
         
-        # Fill the key area with solid green
-        cv2.rectangle(green_overlay, (x, y), (x + w, y + h), (0, 255, 0), -1)
-        
-        # Apply 50% opacity blending
-        alpha = 0.5
-        result = cv2.addWeighted(overlay, 1 - alpha, green_overlay, alpha, 0)
-        
-        return result
+        return overlay
