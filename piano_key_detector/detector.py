@@ -98,19 +98,19 @@ class PianoKeyDetector:
         # Stage 5: You should have the white keys only now
         # This is our final white keys image
         
-        # Stage 6 & 7: Find the first white key and create overlays
+        # Stage 6: Find the first white key and create overlay
         first_white_key = self._find_first_white_key_exact(stage4_crop, params)
         
-        # Create highlighted images (stages 6 & 7)
+        # Create highlighted images (stage 6 only)
         stage6_highlighted = None
-        stage7_highlighted = None
+        stage3_highlighted = None
         
         if first_white_key is not None:
             # Stage 6: Highlight first key in green with 50% opacity dots
             stage6_highlighted = self._create_green_dots_overlay(stage4_crop, first_white_key)
             
-            # Stage 7: Add dotted black line for right boundary at 50% opacity
-            stage7_highlighted = self._create_dotted_boundary_overlay(stage6_highlighted, first_white_key)
+            # Create highlighted Stage 3 image using the width information
+            stage3_highlighted = self._create_stage3_highlighting(stage3_crop, first_white_key, stage4_crop_y)
         
         # Convert coordinates back to original image space for API compatibility
         white_keys = []
@@ -153,16 +153,14 @@ class PianoKeyDetector:
             
             if stage6_highlighted is not None:
                 save_debug_image(stage6_highlighted, "stage6_green_dots")
-            if stage7_highlighted is not None:
-                save_debug_image(stage7_highlighted, "stage7_dotted_boundary")
             
             result["debug"] = {
                 "original": image_bgr,
                 "stage1_crop": stage1_crop,  # Bottom 50%
                 "stage3_crop": stage3_crop,  # Keyboard height  
+                "stage3_highlighted": stage3_highlighted,  # Keyboard height with first key highlighted
                 "stage4_crop": stage4_crop,  # White keys only (bottom 30%)
                 "stage6_highlighted": stage6_highlighted,  # Green dots overlay
-                "stage7_highlighted": stage7_highlighted,  # Dotted boundary
                 "white_keys_region": white_keys_region,
             }
 
@@ -473,6 +471,57 @@ class PianoKeyDetector:
         
         return min(true_right, x_end)  # Don't exceed original detection
 
+    def _create_stage3_highlighting(self, stage3_image: np.ndarray, key_info: Dict[str, object], stage4_y_offset: int) -> np.ndarray:
+        """
+        Create green dots overlay on Stage 3 image using the first white key width information.
+        
+        Args:
+            stage3_image: The Stage 3 cropped image (keyboard height)
+            key_info: Key information detected from Stage 4 
+            stage4_y_offset: Y offset where Stage 4 starts within Stage 3
+        """
+        overlay = stage3_image.copy()
+        bbox = key_info["bbox"]
+        x, y, w, h = bbox
+        
+        # Calculate the position in Stage 3 coordinates
+        # X position remains the same since we only cropped vertically
+        stage3_x = x
+        stage3_y = stage4_y_offset + y  # Add the vertical offset
+        stage3_w = w
+        
+        # Calculate height for Stage 3 - extend to full keyboard height
+        stage3_h = stage3_image.shape[0] - stage3_y
+        
+        # Ensure we don't go outside image bounds
+        if stage3_y >= stage3_image.shape[0] or stage3_x >= stage3_image.shape[1]:
+            return overlay
+            
+        if stage3_x + stage3_w > stage3_image.shape[1]:
+            stage3_w = stage3_image.shape[1] - stage3_x
+            
+        if stage3_y + stage3_h > stage3_image.shape[0]:
+            stage3_h = stage3_image.shape[0] - stage3_y
+        
+        # Create dots pattern
+        dot_size = max(2, min(stage3_w, stage3_h) // 15)  # Slightly smaller dots for Stage 3
+        dot_spacing = dot_size * 3  # Space between dots
+        
+        # Create green overlay with dots
+        green_overlay = overlay.copy()
+        
+        # Fill the key area with dots
+        for dy in range(stage3_y, stage3_y + stage3_h, dot_spacing):
+            for dx in range(stage3_x, stage3_x + stage3_w, dot_spacing):
+                if dy < overlay.shape[0] and dx < overlay.shape[1]:
+                    cv2.circle(green_overlay, (dx, dy), dot_size, (0, 255, 0), -1)
+        
+        # Apply 50% opacity blending
+        alpha = 0.5
+        result = cv2.addWeighted(overlay, 1 - alpha, green_overlay, alpha, 0)
+        
+        return result
+
     def _create_green_dots_overlay(self, image: np.ndarray, key_info: Dict[str, object]) -> np.ndarray:
         """
         Create green dots overlay with 50% opacity on the first white key.
@@ -501,39 +550,5 @@ class PianoKeyDetector:
         # Apply 50% opacity blending
         alpha = 0.5
         result = cv2.addWeighted(overlay, 1 - alpha, green_overlay, alpha, 0)
-        
-        return result
-
-    def _create_dotted_boundary_overlay(self, image: np.ndarray, key_info: Dict[str, object]) -> np.ndarray:
-        """
-        Add dotted black line for right boundary at 50% opacity.
-        """
-        overlay = image.copy()
-        bbox = key_info["bbox"]
-        x, y, w, h = bbox
-        
-        # Right boundary line
-        right_x = x + w
-        
-        # Create dotted line
-        dot_size = 2
-        dot_spacing = 6
-        
-        # Draw dotted line along the right boundary
-        for dy in range(y, y + h, dot_spacing):
-            if dy < overlay.shape[0] and right_x < overlay.shape[1]:
-                cv2.circle(overlay, (right_x, dy), dot_size, (0, 0, 0), -1)
-        
-        # Apply 50% opacity blending for the boundary line area
-        alpha = 0.5
-        line_overlay = image.copy()
-        
-        # Draw the boundary line area on the line overlay
-        for dy in range(y, y + h, dot_spacing):
-            if dy < line_overlay.shape[0] and right_x < line_overlay.shape[1]:
-                cv2.circle(line_overlay, (right_x, dy), dot_size, (0, 0, 0), -1)
-        
-        # Blend only the line area
-        result = cv2.addWeighted(image, 1 - alpha, line_overlay, alpha, 0)
         
         return result
