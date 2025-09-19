@@ -46,6 +46,52 @@ def _draw_detection_overlay(image: np.ndarray, result: Dict[str, object]) -> np.
     return overlay
 
 
+def _display_processing_stages(result: Dict[str, object]) -> None:
+    """Display all 8 processing stages from first-steps.md"""
+    debug = result.get("debug") or {}
+    
+    st.subheader("8 Processing Stages from first-steps.md")
+    
+    # Create columns for stage display
+    col1, col2 = st.columns(2)
+    
+    # Stage 1: Crop the bottom 50% of the uploaded image
+    if "original" in debug:
+        with col1:
+            st.write("**Stage 1: Original Image**")
+            st.image(bgr_to_rgb(debug["original"]), caption="Original uploaded image", use_column_width=True)
+    
+    # Stage 1b: Bottom 50% crop
+    if "stage1_crop" in debug:
+        with col2:
+            st.write("**Stage 1: Bottom 50% Crop**")
+            st.image(bgr_to_rgb(debug["stage1_crop"]), caption="Cropped to bottom 50%", use_column_width=True)
+    
+    # Stage 3: Keyboard height crop
+    if "stage3_crop" in debug:
+        with col1:
+            st.write("**Stage 3: Keyboard Height**")
+            st.image(bgr_to_rgb(debug["stage3_crop"]), caption="Cropped to keyboard height", use_column_width=True)
+    
+    # Stage 4: White keys only (bottom 30%)
+    if "stage4_crop" in debug:
+        with col2:
+            st.write("**Stage 4: White Keys Only**")
+            st.image(bgr_to_rgb(debug["stage4_crop"]), caption="Bottom 30% - white keys only", use_column_width=True)
+    
+    # Stage 6: Green dots overlay
+    if "stage6_highlighted" in debug and debug["stage6_highlighted"] is not None:
+        with col1:
+            st.write("**Stage 6: Green Dots Overlay**")
+            st.image(bgr_to_rgb(debug["stage6_highlighted"]), caption="First white key highlighted with green dots (50% opacity)", use_column_width=True)
+    
+    # Stage 7: Dotted boundary
+    if "stage7_highlighted" in debug and debug["stage7_highlighted"] is not None:
+        with col2:
+            st.write("**Stage 7: Dotted Boundary**")
+            st.image(bgr_to_rgb(debug["stage7_highlighted"]), caption="Right boundary with dotted black line (50% opacity)", use_column_width=True)
+
+
 def _display_debug_images(result: Dict[str, object], show_edges: bool, show_binary: bool) -> None:
     debug = result.get("debug") or {}
     if show_edges and "edges" in debug:
@@ -58,31 +104,34 @@ def _display_debug_images(result: Dict[str, object], show_edges: bool, show_bina
             st.line_chart(projection)
 
 
-st.title("Piano Key Detector - Test Interface")
-st.markdown("Upload a top-down image of a piano or synth keyboard to inspect detections.")
+st.title("Piano Key Detector - First Steps Implementation")
+st.markdown("Upload a top-down image of a piano or synth keyboard to see the 8-step detection process from first-steps.md.")
 
 uploaded_file = st.file_uploader("Upload keyboard image", type=["jpg", "jpeg", "png"])
 
 st.sidebar.header("Detection Parameters")
-keyboard_type_option = st.sidebar.selectbox(
-    "Force Keyboard Type", ["Auto", "25", "37", "49", "61", "72"], index=0
-)
 blur_kernel = st.sidebar.slider("Gaussian Blur Kernel", 3, 21, 5, step=2)
 canny_low = st.sidebar.slider("Canny Low Threshold", 20, 200, 80)
 canny_high = st.sidebar.slider("Canny High Threshold", 50, 300, 180)
 adaptive_block = st.sidebar.slider("Adaptive Threshold Block Size", 3, 75, 35, step=2)
 adaptive_c = st.sidebar.slider("Adaptive Threshold C", -20, 20, 5)
-projection_peak = st.sidebar.slider("Projection Peak Ratio", 0.1, 0.9, 0.45, 0.01)
+projection_peak = st.sidebar.slider("Projection Peak Ratio", 0.1, 0.9, 0.55, 0.01)
 min_white_ratio = st.sidebar.slider("Min White Key Width Ratio", 0.005, 0.05, 0.01, 0.001)
 max_white_ratio = st.sidebar.slider("Max White Key Width Ratio", 0.05, 0.4, 0.2, 0.01)
-black_darkness = st.sidebar.slider("Black Key Darkness Threshold", 0.1, 0.8, 0.35, 0.01)
-show_edges = st.sidebar.checkbox("Show Edge Detection", False)
-show_binary = st.sidebar.checkbox("Show Binary Mask", False)
-
-force_keyboard_type = None if keyboard_type_option == "Auto" else keyboard_type_option
 
 if uploaded_file is None:
-    st.info("Upload an image to begin.")
+    st.info("Upload an image to begin the 8-step detection process.")
+    st.markdown("""
+    ### The 8-Step Process:
+    1. **Crop the bottom 50%** of the uploaded image
+    2. **Find the white keys** in this image
+    3. **Crop the image to the height** of these keys, the area they are inside
+    4. **Further crop** the image produced in stage 3, to the bottom 30% of this image
+    5. **You should have the white keys only** now
+    6. **Find the first white key** and highlight it in green, using 50% opacity green and shaded as dots
+    7. **Highlight the right side boundary** of this key using a dotted black line, 50% opacity
+    8. **Display each of these stages** as images in streamlit
+    """)
 else:
     image = _load_uploaded_image(uploaded_file)
     if image is None:
@@ -91,7 +140,6 @@ else:
         detector = PianoKeyDetector()
         result = detector.detect_keys(
             image,
-            force_keyboard_type=force_keyboard_type,
             blur_kernel_size=blur_kernel,
             canny_low=canny_low,
             canny_high=canny_high,
@@ -100,37 +148,28 @@ else:
             projection_peak_ratio=projection_peak,
             min_white_key_width_ratio=min_white_ratio,
             max_white_key_width_ratio=max_white_ratio,
-            black_key_darkness_threshold=black_darkness,
         )
 
-        debug = result.get("debug") or {}
-        original = debug.get("original", image)
-        overlay = _draw_detection_overlay(original, result)
-
-        col1, col2 = st.columns(2)
-        col1.image(bgr_to_rgb(original), caption="Original", use_column_width=True)
-        col2.image(bgr_to_rgb(overlay), caption="Detections", use_column_width=True)
-
+        # Display the 8 processing stages
+        _display_processing_stages(result)
+        
+        # Detection summary
         st.subheader("Detection Summary")
         summary = {
-            "Keyboard Type": result.get("keyboard_type"),
+            "First White Key Found": result.get("found", False),
             "Total Keys": result.get("total_keys"),
-            "White Keys Detected": len(result.get("white_keys", [])),
-            "Black Keys Detected": len(result.get("black_keys", [])),
             "Confidence": result.get("confidence"),
         }
         st.json(summary)
 
-        with st.expander("White key data"):
-            if result.get("white_keys"):
-                st.dataframe(result["white_keys"])
-            else:
-                st.write("No white keys detected.")
-
-        with st.expander("Black key data"):
-            if result.get("black_keys"):
-                st.dataframe(result["black_keys"])
-            else:
-                st.write("No black keys detected.")
-
-        _display_debug_images(result, show_edges, show_binary)
+        # First white key details
+        if result.get("first_white_key"):
+            with st.expander("First White Key Details"):
+                key_data = result["first_white_key"]
+                st.write(f"**Bounding Box (x, y, width, height):** {key_data['bbox']}")
+                st.write(f"**Center:** {key_data['center']}")
+                st.write(f"**Confidence:** {key_data['confidence']:.3f}")
+                st.write(f"**Aspect Ratio:** {key_data.get('aspect_ratio', 'N/A')}")
+                st.write(f"**Area Ratio:** {key_data.get('area_ratio', 'N/A')}")
+        else:
+            st.warning("No white key detected. Try adjusting the parameters.")
