@@ -106,8 +106,8 @@ class PianoKeyDetector:
         stage3_highlighted = None
         
         if first_white_key is not None:
-            # Stage 6: Highlight first key in green with 50% opacity dots
-            stage6_highlighted = self._create_green_dots_overlay(stage4_crop, first_white_key)
+            # Stage 6: Highlight first key in green with 50% opacity solid fill
+            stage6_highlighted = self._create_green_solid_overlay(stage4_crop, first_white_key)
             
             # Create highlighted Stage 3 image using the width information
             stage3_highlighted = self._create_stage3_highlighting(stage3_crop, first_white_key, stage4_crop_y)
@@ -152,7 +152,9 @@ class PianoKeyDetector:
             save_debug_image(stage4_crop, "stage4_white_keys_only")
             
             if stage6_highlighted is not None:
-                save_debug_image(stage6_highlighted, "stage6_green_dots")
+                save_debug_image(stage6_highlighted, "stage6_green_solid")
+            if stage3_highlighted is not None:
+                save_debug_image(stage3_highlighted, "stage3_highlighted")
             
             result["debug"] = {
                 "original": image_bgr,
@@ -160,7 +162,7 @@ class PianoKeyDetector:
                 "stage3_crop": stage3_crop,  # Keyboard height  
                 "stage3_highlighted": stage3_highlighted,  # Keyboard height with first key highlighted
                 "stage4_crop": stage4_crop,  # White keys only (bottom 30%)
-                "stage6_highlighted": stage6_highlighted,  # Green dots overlay
+                "stage6_highlighted": stage6_highlighted,  # Green solid overlay
                 "white_keys_region": white_keys_region,
             }
 
@@ -404,68 +406,66 @@ class PianoKeyDetector:
         }
 
     def _find_true_right_boundary(self, image: np.ndarray, x_start: int, x_end: int) -> int:
-        """Find the true right boundary of the white key."""
+        """Find the true right boundary of the white key where color is no longer white."""
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         height = gray.shape[0]
         
         true_right = x_start  # Fallback to left edge if nothing found
-        max_gradient = 0
         
-        # Sample several rows
-        sample_rows = range(0, height, max(1, height // 5))
+        # Define what constitutes "white" - use a more precise threshold
+        white_threshold = 200  # Pixels above this are considered white
+        transition_threshold = 30  # Minimum difference to consider a transition
+        
+        # Sample multiple rows to get a robust boundary detection
+        sample_rows = range(0, height, max(1, height // 8))  # More samples for better accuracy
+        boundary_votes = {}  # Track boundary positions across rows
         
         for y in sample_rows:
             if y >= gray.shape[0]:
                 continue
                 
-            # Scan from right to left within the detected region
-            for x in range(min(x_end - 1, gray.shape[1] - 1), x_start, -1):
-                if x >= gray.shape[1]:
-                    continue
+            # Scan from left to right within the detected region
+            for x in range(x_start, min(x_end, gray.shape[1] - 1)):
+                current_pixel = int(gray[y, x])
+                
+                # Check if current pixel is white
+                if current_pixel >= white_threshold:
+                    # Look ahead to see where white transitions to non-white
+                    for next_x in range(x + 1, min(x + 10, gray.shape[1])):  # Look ahead up to 10 pixels
+                        next_pixel = int(gray[y, next_x])
+                        
+                        # Found transition from white to non-white
+                        if current_pixel - next_pixel >= transition_threshold:
+                            boundary_x = x + 1  # Boundary is just after the last white pixel
+                            if boundary_x in boundary_votes:
+                                boundary_votes[boundary_x] += 1
+                            else:
+                                boundary_votes[boundary_x] = 1
+                            break
                     
-                pixel_val = gray[y, x]
-                
-                # Look for white/light pixels (key surface)
-                if pixel_val > 180:  # White key surface
-                    # Check if the next pixel to the right is significantly darker (boundary)
-                    if x + 1 < gray.shape[1]:
-                        next_pixel = int(gray[y, x + 1])
-                        gradient = int(pixel_val) - next_pixel
-                        
-                        # If there's a significant drop in brightness (white key edge)
-                        if gradient > 20 and gradient > max_gradient:
-                            max_gradient = gradient
-                            true_right = max(true_right, x + 1)
-                            break
-                    else:
-                        # At image edge
-                        true_right = max(true_right, x + 1)
-                        break
-                
-                # Look for light grey pixels (key surface with slight shading)
-                elif pixel_val > 140:  # Light grey key surface
-                    if x + 1 < gray.shape[1]:
-                        next_pixel = int(gray[y, x + 1])
-                        gradient = int(pixel_val) - next_pixel
-                        
-                        if gradient > 12 and gradient > max_gradient:
-                            max_gradient = gradient
-                            true_right = max(true_right, x + 1)
-                            break
-                    else:
-                        true_right = max(true_right, x + 1)
-                        break
+                    # If we reach the end without finding a transition, use the rightmost white pixel
+                    if x == min(x_end - 1, gray.shape[1] - 2):
+                        boundary_x = x + 1
+                        if boundary_x in boundary_votes:
+                            boundary_votes[boundary_x] += 1
+                        else:
+                            boundary_votes[boundary_x] = 1
+                    break  # Found first white pixel in this row, move to next row
         
-        # Ensure we found a reasonable boundary
-        if true_right <= x_start:
-            # Fallback: look for the rightmost bright pixel
+        # Find the most voted boundary position
+        if boundary_votes:
+            # Get the boundary with the most votes
+            most_common_boundary = max(boundary_votes.items(), key=lambda x: x[1])
+            true_right = most_common_boundary[0]
+        else:
+            # Fallback: use a simpler approach if no clear boundary found
             for y in sample_rows:
                 if y >= gray.shape[0]:
                     continue
                 for x in range(min(x_end - 1, gray.shape[1] - 1), x_start, -1):
                     if x >= gray.shape[1]:
                         continue
-                    if gray[y, x] > 160:  # Any reasonably bright pixel
+                    if gray[y, x] >= white_threshold:  # Any white pixel
                         true_right = max(true_right, x + 1)
                         break
         
@@ -473,7 +473,7 @@ class PianoKeyDetector:
 
     def _create_stage3_highlighting(self, stage3_image: np.ndarray, key_info: Dict[str, object], stage4_y_offset: int) -> np.ndarray:
         """
-        Create green dots overlay on Stage 3 image using the first white key width information.
+        Create solid green overlay on Stage 3 image using the first white key width information.
         
         Args:
             stage3_image: The Stage 3 cropped image (keyboard height)
@@ -503,18 +503,11 @@ class PianoKeyDetector:
         if stage3_y + stage3_h > stage3_image.shape[0]:
             stage3_h = stage3_image.shape[0] - stage3_y
         
-        # Create dots pattern
-        dot_size = max(2, min(stage3_w, stage3_h) // 15)  # Slightly smaller dots for Stage 3
-        dot_spacing = dot_size * 3  # Space between dots
-        
-        # Create green overlay with dots
+        # Create green overlay with solid fill
         green_overlay = overlay.copy()
         
-        # Fill the key area with dots
-        for dy in range(stage3_y, stage3_y + stage3_h, dot_spacing):
-            for dx in range(stage3_x, stage3_x + stage3_w, dot_spacing):
-                if dy < overlay.shape[0] and dx < overlay.shape[1]:
-                    cv2.circle(green_overlay, (dx, dy), dot_size, (0, 255, 0), -1)
+        # Fill the key area with solid green
+        cv2.rectangle(green_overlay, (stage3_x, stage3_y), (stage3_x + stage3_w, stage3_y + stage3_h), (0, 255, 0), -1)
         
         # Apply 50% opacity blending
         alpha = 0.5
@@ -522,30 +515,19 @@ class PianoKeyDetector:
         
         return result
 
-    def _create_green_dots_overlay(self, image: np.ndarray, key_info: Dict[str, object]) -> np.ndarray:
+    def _create_green_solid_overlay(self, image: np.ndarray, key_info: Dict[str, object]) -> np.ndarray:
         """
-        Create green dots overlay with 50% opacity on the first white key.
+        Create solid green overlay with 50% opacity on the first white key.
         """
         overlay = image.copy()
         bbox = key_info["bbox"]
         x, y, w, h = bbox
         
-        # Create a mask for the key area
-        mask = np.zeros(overlay.shape[:2], dtype=np.uint8)
-        cv2.rectangle(mask, (x, y), (x + w, y + h), 255, -1)
-        
-        # Create dots pattern
-        dot_size = max(2, min(w, h) // 10)  # Dot size based on key size
-        dot_spacing = dot_size * 3  # Space between dots
-        
-        # Create green overlay with dots
+        # Create green overlay with solid fill
         green_overlay = overlay.copy()
         
-        # Fill the key area with dots
-        for dy in range(y, y + h, dot_spacing):
-            for dx in range(x, x + w, dot_spacing):
-                if dy < overlay.shape[0] and dx < overlay.shape[1]:
-                    cv2.circle(green_overlay, (dx, dy), dot_size, (0, 255, 0), -1)
+        # Fill the key area with solid green
+        cv2.rectangle(green_overlay, (x, y), (x + w, y + h), (0, 255, 0), -1)
         
         # Apply 50% opacity blending
         alpha = 0.5

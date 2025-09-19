@@ -73,23 +73,23 @@ def _display_processing_stages(result: Dict[str, object]) -> None:
             st.write("**Stage 3: Keyboard Height**")
             st.image(bgr_to_rgb(debug["stage3_crop"]), caption="Cropped to keyboard height", use_column_width=True)
     
+    # Stage 3 Highlighted: Keyboard height with first key highlighted
+    if "stage3_highlighted" in debug and debug["stage3_highlighted"] is not None:
+        with col2:
+            st.write("**Stage 3: Keyboard Height (Highlighted)**")
+            st.image(bgr_to_rgb(debug["stage3_highlighted"]), caption="First white key highlighted using width from Stage 4", use_column_width=True)
+    
     # Stage 4: White keys only (bottom 30%)
     if "stage4_crop" in debug:
-        with col2:
+        with col1:
             st.write("**Stage 4: White Keys Only**")
             st.image(bgr_to_rgb(debug["stage4_crop"]), caption="Bottom 30% - white keys only", use_column_width=True)
     
     # Stage 6: Green dots overlay
     if "stage6_highlighted" in debug and debug["stage6_highlighted"] is not None:
-        with col1:
+        with col2:
             st.write("**Stage 6: Green Dots Overlay**")
             st.image(bgr_to_rgb(debug["stage6_highlighted"]), caption="First white key highlighted with green dots (50% opacity)", use_column_width=True)
-    
-    # Stage 7: Dotted boundary
-    if "stage7_highlighted" in debug and debug["stage7_highlighted"] is not None:
-        with col2:
-            st.write("**Stage 7: Dotted Boundary**")
-            st.image(bgr_to_rgb(debug["stage7_highlighted"]), caption="Right boundary with dotted black line (50% opacity)", use_column_width=True)
 
 
 def _display_debug_images(result: Dict[str, object], show_edges: bool, show_binary: bool) -> None:
