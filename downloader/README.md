@@ -1,0 +1,1 @@
+`streamlit run video_downloader.py`

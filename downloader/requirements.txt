@@ -1,0 +1,12 @@
+# Requirements for YouTube Video Downloader and Frame Extractor
+# Core dependencies for video_downloader.py
+
+# Web interface and progress tracking
+streamlit>=1.28.0
+
+# Video processing and computer vision
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# YouTube video downloading
+yt-dlp>=2023.9.24
