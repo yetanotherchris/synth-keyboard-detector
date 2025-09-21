@@ -13,7 +13,12 @@ https://github.com/ultralytics/ultralytics
 
 ## Quick Start
 
+You can use the small model and 50 epochs, the dataset is small and the piano shape is very simple.
+
 ```
+streamlit run .\streamlit_train.py
+streamlit run .\streamlit_test.py
+
 # tiny model
 python train.py --dataset ./yolo_dataset --model yolo11n.pt --output ./training_output --epochs 50
 

@@ -2,6 +2,7 @@ opencv-python
 numpy
 pillow
 streamlit
+pandas
 ultralytics
 torch
 torchvision
