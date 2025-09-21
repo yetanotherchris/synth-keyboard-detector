@@ -6,6 +6,12 @@ This project includes:
 - YOLOv8 training pipeline for keyboard object detection (`labeller/` directory)
 - Video downloading and frame extraction tools (`downloader/` directory)
 
+## Machine Learning example output
+Currently Object Detection with bounding boxes only.  
+Semantic Segmentation with Masks coming later.
+![yolo output](./output-yolo-example.jpg)
+
+## 'Traditional' computer vision ouput
 ![output](./output-example.png)
 
 ## Quick Start
