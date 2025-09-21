@@ -29,10 +29,12 @@ class VideoDownloaderApp:
         self.urls_file = self.base_dir / "youtube-urls.txt"
         self.downloaded_videos_dir = self.base_dir / "downloaded_videos"
         self.extracted_frames_dir = self.base_dir / "extracted_frames"
+        self.labelling_images_dir = self.base_dir / "labelling_images"
         
         # Create directories if they don't exist
         self.downloaded_videos_dir.mkdir(exist_ok=True)
         self.extracted_frames_dir.mkdir(exist_ok=True)
+        self.labelling_images_dir.mkdir(exist_ok=True)
         
         # Track errors and progress
         self.errors = []
@@ -301,6 +303,55 @@ class VideoDownloaderApp:
         finally:
             cap.release()
     
+    def extract_labelling_frame(self, video_path: str, frame_number: int) -> str:
+        """Extract a single frame from video at appropriate time for labelling"""
+        video_id = Path(video_path).stem
+        
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise Exception(f"Could not open video file: {video_path}")
+        
+        try:
+            # Get video properties
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            if fps <= 0:
+                fps = 30  # Default fallback
+            
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            duration_seconds = total_frames / fps
+            
+            # Determine extraction time based on video duration
+            if duration_seconds < 60:  # Under 1 minute
+                extract_time = 30  # Extract at 30 seconds
+            elif duration_seconds < 120:  # Under 2 minutes
+                extract_time = 60  # Extract at 1 minute
+            else:
+                extract_time = 120  # Extract at 2 minutes
+            
+            # Ensure we don't seek beyond video duration
+            extract_time = min(extract_time, duration_seconds - 1)
+            
+            # Seek to extraction time
+            target_frame = int(extract_time * fps)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+            
+            ret, frame = cap.read()
+            if not ret:
+                raise Exception(f"Could not read frame at {extract_time}s from video {video_id}")
+            
+            # Save frame as PNG with zero-padded incremental numbering
+            frame_filename = f"{frame_number:02d}_{video_id}.png"
+            frame_path = self.labelling_images_dir / frame_filename
+            
+            # Convert BGR to RGB for proper color and save
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            cv2.imwrite(str(frame_path), cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
+            
+            return str(frame_path)
+            
+        finally:
+            cap.release()
+    
     def run_stage_1(self) -> List[str]:
         """Run Stage 1: Download all videos"""
         st.header("🎬 Stage 1: Downloading Videos")
@@ -373,6 +424,63 @@ class VideoDownloaderApp:
             
             time.sleep(0.5)  # Brief pause between extractions
     
+    def run_stage_3(self):
+        """Run Stage 3: Extract labelling frames from all downloaded videos"""
+        st.header("🖼️ Stage 3: Extracting Labelling Frames")
+        
+        # Get all downloaded video files
+        video_files = list(self.downloaded_videos_dir.glob("*.mp4"))
+        
+        if not video_files:
+            st.warning("No downloaded videos found. Please run Stage 1 first to download videos.")
+            return
+        
+        # Clear existing labelling frames (overwrite as requested)
+        existing_frames = list(self.labelling_images_dir.glob("*.png"))
+        if existing_frames:
+            st.info(f"Removing {len(existing_frames)} existing labelling frames...")
+            for frame_file in existing_frames:
+                frame_file.unlink()
+        
+        st.info(f"Processing {len(video_files)} videos for labelling frame extraction...")
+        
+        frame_number = 1  # Reset numbering each time
+        successful_extractions = []
+        
+        for i, video_path in enumerate(video_files):
+            video_id = video_path.stem
+            st.subheader(f"Extracting labelling frame {i+1}/{len(video_files)}: {video_id}")
+            
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            try:
+                status_text.text("Extracting labelling frame...")
+                progress_bar.progress(0.5)
+                
+                frame_path = self.extract_labelling_frame(str(video_path), frame_number)
+                
+                progress_bar.progress(1.0)
+                status_text.text(f"✅ Extracted labelling frame: {Path(frame_path).name}")
+                
+                successful_extractions.append(video_id)
+                frame_number += 1
+                
+            except Exception as e:
+                error_msg = f"❌ Error extracting labelling frame from {video_id}: {str(e)}"
+                status_text.text(error_msg)
+                self.errors.append(error_msg)
+                st.error(error_msg)
+            
+            time.sleep(0.2)  # Brief pause between extractions
+        
+        # Show final summary
+        if successful_extractions:
+            st.success(f"Successfully extracted {len(successful_extractions)} labelling frames!")
+            st.info(f"Frames saved to: {self.labelling_images_dir}")
+        else:
+            st.error("No labelling frames were extracted successfully.")
+    
     def show_summary(self):
         """Display summary of completed work and errors"""
         st.header("📊 Summary")
@@ -414,7 +522,7 @@ def main():
     app = VideoDownloaderApp()
     
     # Create tabs for different functionality
-    tab1, tab2 = st.tabs(["📦 Bulk Processing", "🎯 Single Video Extraction"])
+    tab1, tab2, tab3 = st.tabs(["📦 Bulk Processing", "🎯 Single Video Extraction", "🏷️ Labelling Frames"])
     
     with tab1:
         st.header("Bulk Processing - All Videos")
@@ -493,11 +601,43 @@ def main():
                     status_text.text(error_msg)
                     st.error(error_msg)
     
+    with tab3:
+        st.header("Labelling Frame Extraction")
+        st.markdown("Extract single frames from all downloaded videos for labelling purposes")
+        
+        # Show information about what this does
+        st.info("**What this does:**\n"
+               "- Processes all videos in the downloaded_videos directory\n"
+               "- Extracts one frame per video at an appropriate time:\n"
+               "  - 2 minutes for videos ≥ 2 minutes\n"
+               "  - 1 minute for videos ≥ 1 minute but < 2 minutes\n"
+               "  - 30 seconds for videos < 1 minute\n"
+               "- Saves frames as zero-padded numbered PNG files: `01_videoid.png`, `02_videoid.png`, etc.\n"
+               "- Overwrites existing labelling frames")
+        
+        # Show current video count
+        video_files = list(app.downloaded_videos_dir.glob("*.mp4"))
+        if video_files:
+            st.success(f"Found {len(video_files)} videos ready for processing")
+            
+            # Show some example video IDs
+            example_videos = [v.stem for v in video_files[:5]]
+            st.text(f"Example videos: {', '.join(example_videos)}")
+            if len(video_files) > 5:
+                st.text(f"... and {len(video_files) - 5} more")
+        else:
+            st.warning("No videos found. Please run 'Bulk Processing' first to download videos.")
+        
+        # Add button to start Stage 3
+        if st.button("🏷️ Extract Labelling Frames", type="primary", key="stage3_extract", disabled=len(video_files) == 0):
+            app.run_stage_3()
+    
     # Show current status in sidebar
     st.sidebar.header("📁 Directory Info")
     st.sidebar.text(f"URLs file: {app.urls_file}")
     st.sidebar.text(f"Downloads: {app.downloaded_videos_dir}")
     st.sidebar.text(f"Frames: {app.extracted_frames_dir}")
+    st.sidebar.text(f"Labelling: {app.labelling_images_dir}")
     
     # Show existing files
     if app.downloaded_videos_dir.exists():
@@ -515,6 +655,10 @@ def main():
     if app.extracted_frames_dir.exists():
         existing_frame_dirs = [d for d in app.extracted_frames_dir.iterdir() if d.is_dir()]
         st.sidebar.text(f"Existing frame dirs: {len(existing_frame_dirs)}")
+    
+    if app.labelling_images_dir.exists():
+        existing_labelling_frames = list(app.labelling_images_dir.glob("*.png"))
+        st.sidebar.text(f"Existing labelling frames: {len(existing_labelling_frames)}")
 
 if __name__ == "__main__":
     main()
