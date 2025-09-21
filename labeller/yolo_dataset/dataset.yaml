@@ -1,0 +1,5 @@
+names:
+  0: piano-keyboard
+path: C:\Users\chris\Documents\GitHub\synth-keyboard-detector\labeller\yolo_dataset
+train: images/train
+val: images/val
